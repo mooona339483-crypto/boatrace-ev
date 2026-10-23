@@ -48,3 +48,5 @@ jobs:
 
       - name: Test probability model
         run: python -m unittest test_probability_model.py -v
+      - name: Test backtest engine
+        run: python -m unittest test_backtest_engine.py -v
