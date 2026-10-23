@@ -45,3 +45,6 @@ jobs:
       - name: Test EV engine
         run: python -m unittest test_ev_engine.py -v
 
+
+      - name: Test probability model
+        run: python -m unittest test_probability_model.py -v
