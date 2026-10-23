@@ -39,3 +39,6 @@ jobs:
 
           print("ALL_SYNTAX_CHECKS_PASSED")
           PY
+      - name: Test pipeline execution
+        run: python -m unittest test_pipeline.py -v
+
