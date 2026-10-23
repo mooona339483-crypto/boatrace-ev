@@ -42,3 +42,6 @@ jobs:
       - name: Test pipeline execution
         run: python -m unittest test_pipeline.py -v
 
+      - name: Test EV engine
+        run: python -m unittest test_ev_engine.py -v
+
