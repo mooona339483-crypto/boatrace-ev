@@ -54,3 +54,5 @@ jobs:
         run: python -m unittest test_bet_manager.py -v
       - name: Test prediction recorder
         run: python -m unittest test_prediction_recorder.py -v
+      - name: Test odds mapper
+        run: python -m unittest test_odds_mapper.py -v
