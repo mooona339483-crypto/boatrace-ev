@@ -56,3 +56,5 @@ jobs:
         run: python -m unittest test_prediction_recorder.py -v
       - name: Test odds mapper
         run: python -m unittest test_odds_mapper.py -v
+      - name: Test racer data parser
+        run: python -m unittest test_racer_data_parser.py -v
