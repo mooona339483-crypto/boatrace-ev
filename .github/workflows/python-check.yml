@@ -1,0 +1,64 @@
+
+name: Python Syntax Check
+
+on:
+  pull_request:
+  push:
+    branches:
+      - mooona339483-crypto-patch-1
+
+permissions:
+  contents: read
+
+jobs:
+  syntax-check:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+
+      - name: Check Python syntax
+        run: |
+          python - <<'PY'
+          import ast
+          from pathlib import Path
+
+          files = sorted(Path(".").glob("*.py"))
+          for path in files:
+              ast.parse(
+                  path.read_text(encoding="utf-8"),
+                  filename=str(path)
+              )
+              print("SYNTAX_OK", path)
+
+          print("ALL_SYNTAX_CHECKS_PASSED")
+          PY
+      - name: Test pipeline execution
+        run: python -m unittest test_pipeline.py -v
+
+      - name: Test EV engine
+        run: python -m unittest test_ev_engine.py -v
+
+
+      - name: Test probability model
+        run: python -m unittest test_probability_model.py -v
+      - name: Test backtest engine
+        run: python -m unittest test_backtest_engine.py -v
+      - name: Test bet manager
+        run: python -m unittest test_bet_manager.py -v
+      - name: Test prediction recorder
+        run: python -m unittest test_prediction_recorder.py -v
+      - name: Test odds mapper
+        run: python -m unittest test_odds_mapper.py -v
+      - name: Test racer data parser
+        run: python -m unittest test_racer_data_parser.py -v
+      - name: Test AI integration
+        run: python -m unittest test_ai_integration.py -v
+      - name: Test validation report
+        run: python -m unittest test_validation_report.py -v
