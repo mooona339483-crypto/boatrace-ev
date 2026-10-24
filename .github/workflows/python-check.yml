@@ -58,3 +58,5 @@ jobs:
         run: python -m unittest test_odds_mapper.py -v
       - name: Test racer data parser
         run: python -m unittest test_racer_data_parser.py -v
+      - name: Test AI integration
+        run: python -m unittest test_ai_integration.py -v
