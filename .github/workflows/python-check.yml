@@ -50,3 +50,5 @@ jobs:
         run: python -m unittest test_probability_model.py -v
       - name: Test backtest engine
         run: python -m unittest test_backtest_engine.py -v
+      - name: Test bet manager
+        run: python -m unittest test_bet_manager.py -v
