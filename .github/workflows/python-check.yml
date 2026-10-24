@@ -60,3 +60,5 @@ jobs:
         run: python -m unittest test_racer_data_parser.py -v
       - name: Test AI integration
         run: python -m unittest test_ai_integration.py -v
+      - name: Test validation report
+        run: python -m unittest test_validation_report.py -v
