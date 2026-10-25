@@ -1,26 +1,29 @@
-name: Check Railway Project Token
+name: List Railway Volumes
 
 on:
   workflow_dispatch:
 
 jobs:
-  check-railway:
+  list-volumes:
     runs-on: ubuntu-latest
     env:
       RAILWAY_TOKEN: ${{ secrets.RAILWAY_TOKEN }}
 
     steps:
-      - name: Check Railway Project Token
+      - name: List Railway volumes
         run: |
-          RESPONSE=$(curl -sS \
+          INFO=$(curl -sS \
             --request POST \
             --url https://backboard.railway.com/graphql/v2 \
             --header "Project-Access-Token: $RAILWAY_TOKEN" \
             --header "Content-Type: application/json" \
             --data '{"query":"query { projectToken { projectId environmentId } }"}')
 
-          echo "$RESPONSE"
+          PROJECT_ID=$(echo "$INFO" | jq -r '.data.projectToken.projectId')
 
-          if echo "$RESPONSE" | grep -q '"errors"'; then
-            exit 1
-          fi
+          curl -sS \
+            --request POST \
+            --url https://backboard.railway.com/graphql/v2 \
+            --header "Project-Access-Token: $RAILWAY_TOKEN" \
+            --header "Content-Type: application/json" \
+            --data "{\"query\":\"query project(\$id: String!) { project(id: \$id) { volumes { edges { node { id name createdAt } } } } }\",\"variables\":{\"id\":\"$PROJECT_ID\"}}"
