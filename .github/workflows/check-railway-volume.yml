@@ -1,17 +1,18 @@
-name: List Railway Volumes
+name: Create Railway Volume
 
 on:
   workflow_dispatch:
 
 jobs:
-  list-volumes:
+  create-volume:
     runs-on: ubuntu-latest
     env:
       RAILWAY_TOKEN: ${{ secrets.RAILWAY_TOKEN }}
 
     steps:
-      - name: List Railway volumes
+      - name: Create Railway volume
         run: |
+          # Project ID を取得
           INFO=$(curl -sS \
             --request POST \
             --url https://backboard.railway.com/graphql/v2 \
@@ -21,9 +22,54 @@ jobs:
 
           PROJECT_ID=$(echo "$INFO" | jq -r '.data.projectToken.projectId')
 
-          curl -sS \
+          echo "PROJECT_ID=$PROJECT_ID"
+
+          # 既存Volumeを確認
+          VOLUMES=$(curl -sS \
             --request POST \
             --url https://backboard.railway.com/graphql/v2 \
             --header "Project-Access-Token: $RAILWAY_TOKEN" \
             --header "Content-Type: application/json" \
-            --data "{\"query\":\"query project(\$id: String!) { project(id: \$id) { volumes { edges { node { id name createdAt } } } } }\",\"variables\":{\"id\":\"$PROJECT_ID\"}}"
+            --data "{\"query\":\"query project(\$id: String!) { project(id: \$id) { volumes { edges { node { id name } } } } }\",\"variables\":{\"id\":\"$PROJECT_ID\"}}")
+
+          COUNT=$(echo "$VOLUMES" | jq '.data.project.volumes.edges | length')
+
+          echo "Existing volumes: $COUNT"
+
+          if [ "$COUNT" -gt 0 ]; then
+            echo "Volume already exists. Nothing created."
+            echo "$VOLUMES"
+            exit 0
+          fi
+
+          # boatrace-ev の Service ID を取得
+          PROJECT=$(curl -sS \
+            --request POST \
+            --url https://backboard.railway.com/graphql/v2 \
+            --header "Project-Access-Token: $RAILWAY_TOKEN" \
+            --header "Content-Type: application/json" \
+            --data "{\"query\":\"query project(\$id: String!) { project(id: \$id) { services { edges { node { id name } } } } }\",\"variables\":{\"id\":\"$PROJECT_ID\"}}")
+
+          SERVICE_ID=$(echo "$PROJECT" | jq -r '.data.project.services.edges[] | select(.node.name=="boatrace-ev") | .node.id')
+
+          if [ -z "$SERVICE_ID" ] || [ "$SERVICE_ID" = "null" ]; then
+            echo "boatrace-ev service not found"
+            echo "$PROJECT"
+            exit 1
+          fi
+
+          echo "SERVICE_ID=$SERVICE_ID"
+
+          # /data にVolumeを作成
+          RESULT=$(curl -sS \
+            --request POST \
+            --url https://backboard.railway.com/graphql/v2 \
+            --header "Project-Access-Token: $RAILWAY_TOKEN" \
+            --header "Content-Type: application/json" \
+            --data "{\"query\":\"mutation volumeCreate(\$input: VolumeCreateInput!) { volumeCreate(input: \$input) { id name } }\",\"variables\":{\"input\":{\"projectId\":\"$PROJECT_ID\",\"serviceId\":\"$SERVICE_ID\",\"mountPath\":\"/data\"}}}")
+
+          echo "$RESULT"
+
+          if echo "$RESULT" | grep -q '"errors"'; then
+            exit 1
+          fi
