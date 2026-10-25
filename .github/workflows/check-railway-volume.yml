@@ -1,4 +1,4 @@
-name: Check Railway API
+name: Check Railway Project Token
 
 on:
   workflow_dispatch:
@@ -7,17 +7,17 @@ jobs:
   check-railway:
     runs-on: ubuntu-latest
     env:
-      RAILWAY_API_TOKEN: ${{ secrets.RAILWAY_API_TOKEN }}
+      RAILWAY_TOKEN: ${{ secrets.RAILWAY_TOKEN }}
 
     steps:
-      - name: Check Railway API access
+      - name: Check Railway Project Token
         run: |
           RESPONSE=$(curl -sS \
             --request POST \
             --url https://backboard.railway.com/graphql/v2 \
-            --header "Authorization: Bearer $RAILWAY_API_TOKEN" \
+            --header "Project-Access-Token: $RAILWAY_TOKEN" \
             --header "Content-Type: application/json" \
-            --data '{"query":"query { me { id } projects { edges { node { id name } } } }"}')
+            --data '{"query":"query { projectToken { projectId environmentId } }"}')
 
           echo "$RESPONSE"
 
