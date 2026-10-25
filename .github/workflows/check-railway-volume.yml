@@ -1,0 +1,23 @@
+name: Check Railway Volume
+
+on:
+  workflow_dispatch:
+
+jobs:
+  check-volume:
+    runs-on: ubuntu-latest
+    env:
+      RAILWAY_API_TOKEN: ${{ secrets.RAILWAY_API_TOKEN }}
+
+    steps:
+      - name: Install Railway CLI
+        run: npm install -g @railway/cli
+
+      - name: Link Railway project
+        run: railway link --project diligent-vitality --environment production --service boatrace-ev --json
+
+      - name: Show Railway status
+        run: railway status
+
+      - name: List Railway volumes
+        run: railway volume list --json
