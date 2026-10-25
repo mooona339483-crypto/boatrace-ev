@@ -1,23 +1,26 @@
-name: Check Railway Volume
+name: Check Railway API
 
 on:
   workflow_dispatch:
 
 jobs:
-  check-volume:
+  check-railway:
     runs-on: ubuntu-latest
     env:
       RAILWAY_API_TOKEN: ${{ secrets.RAILWAY_API_TOKEN }}
 
     steps:
-      - name: Install Railway CLI
-        run: npm install -g @railway/cli
+      - name: Check Railway API access
+        run: |
+          RESPONSE=$(curl -sS \
+            --request POST \
+            --url https://backboard.railway.com/graphql/v2 \
+            --header "Authorization: Bearer $RAILWAY_API_TOKEN" \
+            --header "Content-Type: application/json" \
+            --data '{"query":"query { me { id } projects { edges { node { id name } } } }"}')
 
-      - name: Link Railway project
-        run: railway link --project diligent-vitality --environment production --service boatrace-ev --json
+          echo "$RESPONSE"
 
-      - name: Show Railway status
-        run: railway status
-
-      - name: List Railway volumes
-        run: railway volume list --json
+          if echo "$RESPONSE" | grep -q '"errors"'; then
+            exit 1
+          fi
