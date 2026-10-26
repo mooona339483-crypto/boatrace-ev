@@ -361,6 +361,7 @@ def run():
                 raw_html
             FROM market_snapshots
             WHERE pre_deadline=1
+              AND category != 'female'
               AND snapshot_type
                   IN ('odds2t', 'odds3t')
             ORDER BY id
@@ -394,17 +395,23 @@ def run():
                 expected = 120
                 bet_type = "3T"
 
-            processed += 1            
+            processed += 1
+
             active_boats = set()
+
             for selection in odds_map:
                 active_boats.update(
-                    int(x) for x in selection.split("-")
+                    int(x)
+                    for x in selection.split("-")
                 )
 
             boat_count = len(active_boats)
 
             if bet_type == "2T":
-                expected = boat_count * (boat_count - 1)
+                expected = (
+                    boat_count
+                    * (boat_count - 1)
+                )
             else:
                 expected = (
                     boat_count
