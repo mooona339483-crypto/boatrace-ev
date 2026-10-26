@@ -91,6 +91,7 @@ def get_today_races():
                 deadline
             FROM race_pages
             WHERE race_date=?
+              AND category != 'female'
             GROUP BY
                 venue_code,
                 venue_name,
