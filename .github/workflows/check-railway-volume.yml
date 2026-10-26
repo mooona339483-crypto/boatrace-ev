@@ -1,75 +1,43 @@
-name: Create Railway Volume
+name: Python Check
 
 on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
   workflow_dispatch:
 
 jobs:
-  create-volume:
+  python-check:
     runs-on: ubuntu-latest
-    env:
-      RAILWAY_TOKEN: ${{ secrets.RAILWAY_TOKEN }}
 
     steps:
-      - name: Create Railway volume
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Python syntax check
         run: |
-          # Project ID を取得
-          INFO=$(curl -sS \
-            --request POST \
-            --url https://backboard.railway.com/graphql/v2 \
-            --header "Project-Access-Token: $RAILWAY_TOKEN" \
-            --header "Content-Type: application/json" \
-            --data '{"query":"query { projectToken { projectId environmentId } }"}')
+          python -m py_compile \
+            collector.py \
+            market_collector.py \
+            parser.py \
+            odds_mapper.py \
+            run_pipeline.py \
+            ev_engine.py \
+            racer_data_parser.py \
+            probability_model.py \
+            bet_manager.py \
+            prediction_recorder.py \
+            backtest_engine.py \
+            ai_integration.py
 
-          PROJECT_ID=$(echo "$INFO" | jq -r '.data.projectToken.projectId')
-
-          echo "PROJECT_ID=$PROJECT_ID"
-
-          # 既存Volumeを確認
-          VOLUMES=$(curl -sS \
-            --request POST \
-            --url https://backboard.railway.com/graphql/v2 \
-            --header "Project-Access-Token: $RAILWAY_TOKEN" \
-            --header "Content-Type: application/json" \
-            --data "{\"query\":\"query project(\$id: String!) { project(id: \$id) { volumes { edges { node { id name } } } } }\",\"variables\":{\"id\":\"$PROJECT_ID\"}}")
-
-          COUNT=$(echo "$VOLUMES" | jq '.data.project.volumes.edges | length')
-
-          echo "Existing volumes: $COUNT"
-
-          if [ "$COUNT" -gt 0 ]; then
-            echo "Volume already exists. Nothing created."
-            echo "$VOLUMES"
-            exit 0
-          fi
-
-          # boatrace-ev の Service ID を取得
-          PROJECT=$(curl -sS \
-            --request POST \
-            --url https://backboard.railway.com/graphql/v2 \
-            --header "Project-Access-Token: $RAILWAY_TOKEN" \
-            --header "Content-Type: application/json" \
-            --data "{\"query\":\"query project(\$id: String!) { project(id: \$id) { services { edges { node { id name } } } } }\",\"variables\":{\"id\":\"$PROJECT_ID\"}}")
-
-          SERVICE_ID=$(echo "$PROJECT" | jq -r '.data.project.services.edges[] | select(.node.name=="boatrace-ev") | .node.id')
-
-          if [ -z "$SERVICE_ID" ] || [ "$SERVICE_ID" = "null" ]; then
-            echo "boatrace-ev service not found"
-            echo "$PROJECT"
-            exit 1
-          fi
-
-          echo "SERVICE_ID=$SERVICE_ID"
-
-          # /data にVolumeを作成
-          RESULT=$(curl -sS \
-            --request POST \
-            --url https://backboard.railway.com/graphql/v2 \
-            --header "Project-Access-Token: $RAILWAY_TOKEN" \
-            --header "Content-Type: application/json" \
-            --data "{\"query\":\"mutation volumeCreate(\$input: VolumeCreateInput!) { volumeCreate(input: \$input) { id name } }\",\"variables\":{\"input\":{\"projectId\":\"$PROJECT_ID\",\"serviceId\":\"$SERVICE_ID\",\"mountPath\":\"/data\"}}}")
-
-          echo "$RESULT"
-
-          if echo "$RESULT" | grep -q '"errors"'; then
-            exit 1
-          fi
+      - name: Run unit tests
+        run: |
+          python -m unittest discover -v -p "test_*.py"
