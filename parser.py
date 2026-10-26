@@ -274,6 +274,7 @@ def run():
                 raw_html
             FROM market_snapshots
             WHERE pre_deadline=1
+              AND category != 'female'
             ORDER BY id
             """
         ).fetchall()
