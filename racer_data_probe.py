@@ -1,12 +1,9 @@
 import os
 import sqlite3
 
-from combined_racer_parser import (
-    evaluate_combined_readiness,
-    parse_exhibition_times,
-    parse_racelist,
-    parse_start_courses,
-)
+from boatcast_preview import fetch_preview
+from combined_racer_parser import parse_racelist
+from racer_data_parser import RacerData
 
 
 DB = os.environ.get(
@@ -35,10 +32,10 @@ def get_latest_races():
         rows = con.execute(
             """
             SELECT
+                m.venue_code,
                 m.venue_name,
                 m.race_no,
-                r.raw_html,
-                m.raw_html
+                r.raw_html
             FROM market_snapshots AS m
 
             INNER JOIN race_pages AS r
@@ -81,9 +78,60 @@ def get_latest_races():
     return race_date, rows
 
 
+def build_boats(
+    racelist,
+    preview,
+):
+    exhibition = preview[
+        "exhibition"
+    ]
+
+    courses = preview[
+        "courses"
+    ]
+
+    active = sorted(
+        set(racelist)
+        & set(exhibition)
+        & set(courses)
+    )
+
+    if len(active) not in (
+        5,
+        6,
+    ):
+        return []
+
+    boats = []
+
+    for number in active:
+        base = racelist[number]
+
+        boats.append(
+            RacerData(
+                number=number,
+                racer_win_rate=base[
+                    "racer_win_rate"
+                ],
+                motor_2rate=base[
+                    "motor_2rate"
+                ],
+                exhibition_time=(
+                    exhibition[number]
+                ),
+                average_st=base[
+                    "average_st"
+                ],
+                course=courses[number],
+            )
+        )
+
+    return boats
+
+
 def main():
     print(
-        "NUMERIC_PROBE_START",
+        "BOATCAST_PROBE_START",
         "db=",
         DB,
         flush=True,
@@ -94,7 +142,7 @@ def main():
 
     except sqlite3.Error as error:
         print(
-            "NUMERIC_PROBE_DB_ERROR",
+            "BOATCAST_PROBE_DB_ERROR",
             str(error)[:200],
             flush=True,
         )
@@ -102,7 +150,7 @@ def main():
 
     if not race_date:
         print(
-            "NUMERIC_PROBE_NO_DATA",
+            "BOATCAST_PROBE_NO_DATA",
             flush=True,
         )
         return
@@ -112,58 +160,73 @@ def main():
     sample_printed = False
 
     for (
+        venue_code,
         venue_name,
         race_no,
         racelist_html,
-        beforeinfo_html,
     ) in rows:
 
         racelist = parse_racelist(
             racelist_html
         )
 
-        exhibition = parse_exhibition_times(
-            beforeinfo_html
+        preview = fetch_preview(
+            race_date,
+            venue_code,
+            race_no,
         )
 
-        courses = parse_start_courses(
-            beforeinfo_html
-        )
+        boats = []
 
-        result = evaluate_combined_readiness(
-            racelist_html,
-            beforeinfo_html,
-        )
+        if preview["status"] == "READY":
+            boats = build_boats(
+                racelist,
+                preview,
+            )
+
+        if len(boats) in (
+            5,
+            6,
+        ):
+            ready += 1
+            status = "READY_FOR_MODEL"
+
+        else:
+            skipped += 1
+            status = "SKIP"
 
         print(
-            "NUMERIC_RACE",
+            "BOATCAST_RACE",
             venue_name,
             f"{race_no}R",
-            result["status"],
+            status,
             "racers=",
             len(racelist),
             "exhibition=",
-            len(exhibition),
+            len(
+                preview["exhibition"]
+            ),
             "courses=",
-            len(courses),
+            len(
+                preview["courses"]
+            ),
+            "reason=",
+            preview["reason"],
             flush=True,
         )
 
-        if result["status"] != "READY_FOR_MODEL":
-            skipped += 1
-            continue
-
-        ready += 1
-
-        if not sample_printed:
+        if (
+            status == "READY_FOR_MODEL"
+            and not sample_printed
+        ):
             print(
-                "NUMERIC_SAMPLE",
+                "BOATCAST_SAMPLE",
                 venue_name,
                 f"{race_no}R",
                 flush=True,
             )
 
-            for boat in result["boats"]:
+            for boat in boats:
                 print(
                     "BOAT",
                     boat.number,
@@ -183,7 +246,7 @@ def main():
             sample_printed = True
 
     print(
-        "NUMERIC_PROBE_DONE",
+        "BOATCAST_PROBE_DONE",
         "date=",
         race_date,
         "checked=",
