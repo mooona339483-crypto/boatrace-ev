@@ -1,4 +1,4 @@
-import os
+つimport os
 import sqlite3
 import urllib.request
 import datetime
@@ -68,9 +68,19 @@ def init_db():
 
 
 def get_today_races():
-    today = datetime.datetime.now(JST).strftime("%Y%m%d")
-
     with sqlite3.connect(DB) as con:
+        row = con.execute(
+            """
+            SELECT MAX(race_date)
+            FROM race_pages
+            """
+        ).fetchone()
+
+        if not row or not row[0]:
+            return None, []
+
+        race_date = row[0]
+
         rows = con.execute(
             """
             SELECT
@@ -89,10 +99,10 @@ def get_today_races():
                 deadline
             ORDER BY venue_code, race_no
             """,
-            (today,),
+            (race_date,),
         ).fetchall()
 
-    return today, rows
+    return race_date, rows
 
 
 def deadline_datetime(race_date, deadline):
