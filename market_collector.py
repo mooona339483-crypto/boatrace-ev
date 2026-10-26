@@ -1,4 +1,4 @@
-つimport os
+import os
 import sqlite3
 import urllib.request
 import datetime
