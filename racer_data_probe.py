@@ -1,12 +1,7 @@
 import os
 import sqlite3
-from collections import Counter
 from html.parser import HTMLParser
 
-from racer_data_parser import (
-    RacerTableParser,
-    evaluate_data_readiness,
-)
 
 DB = os.environ.get(
     "DB_PATH",
@@ -15,50 +10,32 @@ DB = os.environ.get(
 
 MAX_RACES = 12
 
-KEYWORDS = (
-    "枠",
-    "ボートレーサー",
-    "勝率",
-    "全国",
-    "当地",
-    "モーター",
-    "2連",
-    "展示",
-    "平均ST",
-    "平均スタート",
-    "進入",
-    "コース",
-    "欠場",
-)
 
-class PageInspector(HTMLParser):
+class TextParser(HTMLParser):
     def __init__(self):
         super().__init__()
-        self.titles = []
-        self.text = []
-        self.capture_title = False
-
-    def handle_starttag(self, tag, attrs):
-        if tag == "title":
-            self.capture_title = True
-
-    def handle_endtag(self, tag):
-        if tag == "title":
-            self.capture_title = False
+        self.parts = []
 
     def handle_data(self, data):
-        value = " ".join(data.split())
-        if not value:
-            return
+        text = " ".join(data.split())
 
-        if self.capture_title:
-            self.titles.append(value)
+        if text:
+            self.parts.append(text)
 
-        self.text.append(value)
+    def get_text(self):
+        return " ".join(self.parts)
 
 
-def get_latest_beforeinfo():
+def html_text(html):
+    parser = TextParser()
+    parser.feed(html)
+
+    return parser.get_text()
+
+
+def get_latest_combined_races():
     with sqlite3.connect(DB) as con:
+
         row = con.execute(
             """
             SELECT MAX(race_date)
@@ -80,129 +57,73 @@ def get_latest_beforeinfo():
                 m.race_no,
                 m.category,
                 m.deadline,
-                m.fetched_at,
-                m.raw_html
+                r.raw_html AS racelist_html,
+                m.raw_html AS beforeinfo_html
             FROM market_snapshots AS m
-            INNER JOIN (
-                SELECT
-                    venue_code,
-                    race_no,
-                    MAX(id) AS latest_id
-                FROM market_snapshots
-                WHERE race_date=?
-                  AND snapshot_type='beforeinfo'
-                  AND pre_deadline=1
-                  AND category != 'female'
-                GROUP BY venue_code, race_no
-            ) AS latest
-                ON m.id = latest.latest_id
+
+            INNER JOIN race_pages AS r
+                ON r.race_date = m.race_date
+                AND r.venue_code = m.venue_code
+                AND r.race_no = m.race_no
+
+            WHERE m.race_date = ?
+              AND m.snapshot_type = 'beforeinfo'
+              AND m.pre_deadline = 1
+              AND m.category != 'female'
+
+              AND m.id = (
+                  SELECT MAX(m2.id)
+                  FROM market_snapshots AS m2
+                  WHERE m2.race_date = m.race_date
+                    AND m2.venue_code = m.venue_code
+                    AND m2.race_no = m.race_no
+                    AND m2.snapshot_type = 'beforeinfo'
+                    AND m2.pre_deadline = 1
+              )
+
+              AND r.fetched_at = (
+                  SELECT MAX(r2.fetched_at)
+                  FROM race_pages AS r2
+                  WHERE r2.race_date = r.race_date
+                    AND r2.venue_code = r.venue_code
+                    AND r2.race_no = r.race_no
+              )
+
             ORDER BY m.id DESC
             LIMIT ?
             """,
-            (race_date, MAX_RACES),
+            (
+                race_date,
+                MAX_RACES,
+            ),
         ).fetchall()
 
     return race_date, rows
 
 
-def inspect_html(html):
-    if not isinstance(html, str):
-        print(
-            "DIAG_HTML_INVALID",
-            type(html).__name__,
-            flush=True,
-        )
-        return
-
-    print(
-        "DIAG_HTML_LENGTH",
-        len(html),
-        flush=True,
+def has_any(text, words):
+    return any(
+        word in text
+        for word in words
     )
-
-    page = PageInspector()
-    page.feed(html)
-
-    print(
-        "DIAG_TITLE",
-        " ".join(page.titles)[:160],
-        flush=True,
-    )
-
-    parser = RacerTableParser()
-    parser.feed(html)
-
-    print(
-        "DIAG_ROW_COUNT",
-        len(parser.rows),
-        flush=True,
-    )
-
-    matched = []
-
-    for index, row in enumerate(parser.rows):
-        line = " | ".join(
-            " ".join(str(cell).split())
-            for cell in row
-        )
-
-        if any(word in line for word in KEYWORDS):
-            matched.append((index, line))
-
-    print(
-        "DIAG_MATCHED_ROWS",
-        len(matched),
-        flush=True,
-    )
-
-    for index, line in matched[:12]:
-        print(
-            "DIAG_ROW",
-            index,
-            line[:350],
-            flush=True,
-        )
-
-        for offset in (1, 2):
-            next_index = index + offset
-
-            if next_index < len(parser.rows):
-                next_row = parser.rows[next_index]
-
-                print(
-                    "DIAG_NEXT",
-                    next_index,
-                    " | ".join(
-                        str(x) for x in next_row
-                    )[:350],
-                    flush=True,
-                )
-
-    text = " ".join(page.text)
-
-    for word in KEYWORDS:
-        print(
-            "DIAG_FIELD",
-            word,
-            "present=",
-            word in text,
-            flush=True,
-        )
 
 
 def main():
     print(
-        "RACER_DATA_PROBE_START",
+        "COMBINED_PROBE_START",
         "db=",
         DB,
         flush=True,
     )
 
     try:
-        race_date, rows = get_latest_beforeinfo()
+        race_date, rows = (
+            get_latest_combined_races()
+        )
+
     except sqlite3.Error as error:
         print(
-            "PROBE_DB_ERROR",
+            "COMBINED_PROBE_DB_ERROR",
             type(error).__name__,
             str(error)[:200],
             flush=True,
@@ -211,90 +132,132 @@ def main():
 
     if not race_date:
         print(
-            "RACER_DATA_PROBE_NO_DATE",
+            "COMBINED_PROBE_NO_DATE",
             flush=True,
         )
         return
 
     print(
-        "RACER_DATA_PROBE_DATE",
+        "COMBINED_PROBE_DATE",
         race_date,
         "races=",
         len(rows),
         flush=True,
     )
 
-    counts = Counter()
+    complete = 0
+    incomplete = 0
 
-    for row in rows:
-        (
-            venue_code,
-            venue_name,
-            race_no,
-            category,
-            deadline,
-            fetched_at,
-            raw_html,
-        ) = row
+    for (
+        venue_code,
+        venue_name,
+        race_no,
+        category,
+        deadline,
+        racelist_html,
+        beforeinfo_html,
+    ) in rows:
+
+        racelist_text = html_text(
+            racelist_html
+        )
+
+        beforeinfo_text = html_text(
+            beforeinfo_html
+        )
+
+        average_st = has_any(
+            racelist_text,
+            (
+                "平均ST",
+                "平均スタート",
+            ),
+        )
+
+        national = (
+            "全国" in racelist_text
+        )
+
+        local = (
+            "当地" in racelist_text
+        )
+
+        motor = (
+            "モーター" in racelist_text
+            and has_any(
+                racelist_text,
+                (
+                    "2連率",
+                    "2連",
+                ),
+            )
+        )
+
+        exhibition = has_any(
+            beforeinfo_text,
+            (
+                "展示タイム",
+                "展示",
+            ),
+        )
+
+        course = has_any(
+            beforeinfo_text,
+            (
+                "進入",
+                "コース",
+            ),
+        )
+
+        ok = all(
+            (
+                average_st,
+                national,
+                local,
+                motor,
+                exhibition,
+                course,
+            )
+        )
+
+        if ok:
+            complete += 1
+            status = "COMPLETE"
+
+        else:
+            incomplete += 1
+            status = "INCOMPLETE"
 
         print(
-            "PROBE_RACE",
+            "COMBINED_RACE",
             venue_name,
             f"{race_no}R",
-            "category=",
-            category,
-            "deadline=",
-            deadline,
-            flush=True,
-        )
-
-        result = evaluate_data_readiness(raw_html)
-
-        status = result["status"]
-        counts[status] += 1
-
-        print(
-            "PROBE_RESULT",
             status,
-            result["reason"],
-            "boats=",
-            len(result["boats"]),
+            "avgST=",
+            int(average_st),
+            "national=",
+            int(national),
+            "local=",
+            int(local),
+            "motor=",
+            int(motor),
+            "exhibition=",
+            int(exhibition),
+            "course=",
+            int(course),
             flush=True,
         )
-
-        if status == "READY_FOR_VALIDATION":
-            for boat in result["boats"]:
-                print(
-                    "BOAT",
-                    boat.number,
-                    "win=",
-                    boat.racer_win_rate,
-                    "motor=",
-                    boat.motor_2rate,
-                    "exhibition=",
-                    boat.exhibition_time,
-                    "st=",
-                    boat.average_st,
-                    "course=",
-                    boat.course,
-                    flush=True,
-                )
-        else:
-            inspect_html(raw_html)
-
-    ready = counts["READY_FOR_VALIDATION"]
-    skipped = len(rows) - ready
 
     print(
-        "RACER_DATA_PROBE_DONE",
+        "COMBINED_PROBE_DONE",
         "date=",
         race_date,
         "checked=",
         len(rows),
-        "ready=",
-        ready,
-        "skipped=",
-        skipped,
+        "complete=",
+        complete,
+        "incomplete=",
+        incomplete,
         flush=True,
     )
 
