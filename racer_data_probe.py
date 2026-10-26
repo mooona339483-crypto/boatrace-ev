@@ -1,6 +1,12 @@
 import os
 import sqlite3
-from html.parser import HTMLParser
+
+from combined_racer_parser import (
+    evaluate_combined_readiness,
+    parse_exhibition_times,
+    parse_racelist,
+    parse_start_courses,
+)
 
 
 DB = os.environ.get(
@@ -11,31 +17,8 @@ DB = os.environ.get(
 MAX_RACES = 12
 
 
-class TextParser(HTMLParser):
-    def __init__(self):
-        super().__init__()
-        self.parts = []
-
-    def handle_data(self, data):
-        text = " ".join(data.split())
-
-        if text:
-            self.parts.append(text)
-
-    def get_text(self):
-        return " ".join(self.parts)
-
-
-def html_text(html):
-    parser = TextParser()
-    parser.feed(html)
-
-    return parser.get_text()
-
-
-def get_latest_combined_races():
+def get_latest_races():
     with sqlite3.connect(DB) as con:
-
         row = con.execute(
             """
             SELECT MAX(race_date)
@@ -52,13 +35,10 @@ def get_latest_combined_races():
         rows = con.execute(
             """
             SELECT
-                m.venue_code,
                 m.venue_name,
                 m.race_no,
-                m.category,
-                m.deadline,
-                r.raw_html AS racelist_html,
-                m.raw_html AS beforeinfo_html
+                r.raw_html,
+                m.raw_html
             FROM market_snapshots AS m
 
             INNER JOIN race_pages AS r
@@ -101,30 +81,20 @@ def get_latest_combined_races():
     return race_date, rows
 
 
-def has_any(text, words):
-    return any(
-        word in text
-        for word in words
-    )
-
-
 def main():
     print(
-        "COMBINED_PROBE_START",
+        "NUMERIC_PROBE_START",
         "db=",
         DB,
         flush=True,
     )
 
     try:
-        race_date, rows = (
-            get_latest_combined_races()
-        )
+        race_date, rows = get_latest_races()
 
     except sqlite3.Error as error:
         print(
-            "COMBINED_PROBE_DB_ERROR",
-            type(error).__name__,
+            "NUMERIC_PROBE_DB_ERROR",
             str(error)[:200],
             flush=True,
         )
@@ -132,132 +102,96 @@ def main():
 
     if not race_date:
         print(
-            "COMBINED_PROBE_NO_DATE",
+            "NUMERIC_PROBE_NO_DATA",
             flush=True,
         )
         return
 
-    print(
-        "COMBINED_PROBE_DATE",
-        race_date,
-        "races=",
-        len(rows),
-        flush=True,
-    )
-
-    complete = 0
-    incomplete = 0
+    ready = 0
+    skipped = 0
+    sample_printed = False
 
     for (
-        venue_code,
         venue_name,
         race_no,
-        category,
-        deadline,
         racelist_html,
         beforeinfo_html,
     ) in rows:
 
-        racelist_text = html_text(
+        racelist = parse_racelist(
             racelist_html
         )
 
-        beforeinfo_text = html_text(
+        exhibition = parse_exhibition_times(
             beforeinfo_html
         )
 
-        average_st = has_any(
-            racelist_text,
-            (
-                "平均ST",
-                "平均スタート",
-            ),
+        courses = parse_start_courses(
+            beforeinfo_html
         )
 
-        national = (
-            "全国" in racelist_text
+        result = evaluate_combined_readiness(
+            racelist_html,
+            beforeinfo_html,
         )
-
-        local = (
-            "当地" in racelist_text
-        )
-
-        motor = (
-            "モーター" in racelist_text
-            and has_any(
-                racelist_text,
-                (
-                    "2連率",
-                    "2連",
-                ),
-            )
-        )
-
-        exhibition = has_any(
-            beforeinfo_text,
-            (
-                "展示タイム",
-                "展示",
-            ),
-        )
-
-        course = has_any(
-            beforeinfo_text,
-            (
-                "進入",
-                "コース",
-            ),
-        )
-
-        ok = all(
-            (
-                average_st,
-                national,
-                local,
-                motor,
-                exhibition,
-                course,
-            )
-        )
-
-        if ok:
-            complete += 1
-            status = "COMPLETE"
-
-        else:
-            incomplete += 1
-            status = "INCOMPLETE"
 
         print(
-            "COMBINED_RACE",
+            "NUMERIC_RACE",
             venue_name,
             f"{race_no}R",
-            status,
-            "avgST=",
-            int(average_st),
-            "national=",
-            int(national),
-            "local=",
-            int(local),
-            "motor=",
-            int(motor),
+            result["status"],
+            "racers=",
+            len(racelist),
             "exhibition=",
-            int(exhibition),
-            "course=",
-            int(course),
+            len(exhibition),
+            "courses=",
+            len(courses),
             flush=True,
         )
 
+        if result["status"] != "READY_FOR_MODEL":
+            skipped += 1
+            continue
+
+        ready += 1
+
+        if not sample_printed:
+            print(
+                "NUMERIC_SAMPLE",
+                venue_name,
+                f"{race_no}R",
+                flush=True,
+            )
+
+            for boat in result["boats"]:
+                print(
+                    "BOAT",
+                    boat.number,
+                    "win=",
+                    boat.racer_win_rate,
+                    "motor=",
+                    boat.motor_2rate,
+                    "exhibition=",
+                    boat.exhibition_time,
+                    "avgST=",
+                    boat.average_st,
+                    "course=",
+                    boat.course,
+                    flush=True,
+                )
+
+            sample_printed = True
+
     print(
-        "COMBINED_PROBE_DONE",
+        "NUMERIC_PROBE_DONE",
         "date=",
         race_date,
         "checked=",
         len(rows),
-        "complete=",
-        complete,
-        "incomplete=",
-        incomplete,
+        "ready=",
+        ready,
+        "skipped=",
+        skipped,
         flush=True,
     )
 
