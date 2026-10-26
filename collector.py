@@ -44,7 +44,6 @@ FEMALE_KEYWORDS = (
     "レディースチャンピオン",
     "レディースオールスター",
     "クイーンズクライマックス",
-    "女子",
 )
 
 BASE = "https://www.boatrace.jp/owpc/pc/race/racelist"
@@ -78,6 +77,7 @@ def fetch(url):
             "Accept-Language": "ja-JP,ja;q=0.9",
         },
     )
+
     with urllib.request.urlopen(req, timeout=20) as res:
         charset = res.headers.get_content_charset() or "utf-8"
         return res.read().decode(charset, errors="replace")
@@ -87,19 +87,23 @@ def detect_category(text):
     for keyword in FEMALE_KEYWORDS:
         if keyword in text:
             return "female"
+
     return "mixed"
 
 
 def extract_deadlines(text):
-    # 出走表ページには1R～12Rの締切予定時刻が並ぶ
     m = re.search(
         r"締切予定時刻\s+((?:\d{1,2}:\d{2}\s*){12})",
-        text
+        text,
     )
+
     if not m:
         return []
 
-    return re.findall(r"\d{1,2}:\d{2}", m.group(1))
+    return re.findall(
+        r"\d{1,2}:\d{2}",
+        m.group(1),
+    )
 
 
 def init_db():
@@ -116,7 +120,12 @@ def init_db():
                 fetched_at TEXT NOT NULL,
                 source_url TEXT NOT NULL,
                 raw_html TEXT NOT NULL,
-                PRIMARY KEY (race_date, venue_code, race_no, fetched_at)
+                PRIMARY KEY (
+                    race_date,
+                    venue_code,
+                    race_no,
+                    fetched_at
+                )
             )
             """
         )
@@ -194,8 +203,12 @@ def collect(race_date=None):
             )
             VALUES (?, ?)
             """,
-            (started_at, race_date),
+            (
+                started_at,
+                race_date,
+            ),
         )
+
         run_id = cur.lastrowid
 
     active_venues = 0
@@ -204,19 +217,24 @@ def collect(race_date=None):
 
     for venue_code, venue_name in VENUES.items():
 
-        # まず1Rで開催中か確認
         check_url = (
             f"{BASE}?hd={race_date}"
-            f"&jcd={venue_code}&rno=1"
+            f"&jcd={venue_code}"
+            f"&rno=1"
         )
 
         try:
             html = fetch(check_url)
             text = html_to_text(html)
 
-            # 非開催ページを除外
-            if "締切予定時刻" not in text or "出走表" not in text:
-                print("SKIP", venue_name)
+            if (
+                "締切予定時刻" not in text
+                or "出走表" not in text
+            ):
+                print(
+                    "SKIP",
+                    venue_name,
+                )
                 continue
 
             active_venues += 1
@@ -234,16 +252,24 @@ def collect(race_date=None):
             for race_no in range(1, 13):
                 url = (
                     f"{BASE}?hd={race_date}"
-                    f"&jcd={venue_code}&rno={race_no}"
+                    f"&jcd={venue_code}"
+                    f"&rno={race_no}"
                 )
 
                 try:
                     race_html = fetch(url)
-                    fetched_at = datetime.datetime.now(JST).isoformat()
+
+                    fetched_at = (
+                        datetime.datetime.now(JST)
+                        .isoformat()
+                    )
 
                     deadline = None
+
                     if len(deadlines) >= race_no:
-                        deadline = deadlines[race_no - 1]
+                        deadline = deadlines[
+                            race_no - 1
+                        ]
 
                     save_page(
                         race_date=race_date,
@@ -267,11 +293,11 @@ def collect(race_date=None):
                         category,
                     )
 
-                    # 公式サイトへ過剰アクセスしない
                     time.sleep(0.5)
 
                 except Exception as e:
                     error_count += 1
+
                     print(
                         "ERROR",
                         venue_name,
@@ -284,6 +310,7 @@ def collect(race_date=None):
 
         except Exception as e:
             error_count += 1
+
             print(
                 "VENUE_ERROR",
                 venue_name,
@@ -292,7 +319,10 @@ def collect(race_date=None):
 
         time.sleep(0.5)
 
-    finished_at = datetime.datetime.now(JST).isoformat()
+    finished_at = (
+        datetime.datetime.now(JST)
+        .isoformat()
+    )
 
     with sqlite3.connect(DB) as con:
         con.execute(
@@ -315,10 +345,14 @@ def collect(race_date=None):
 
     print(
         "COLLECTOR_DONE",
-        "date=", race_date,
-        "venues=", active_venues,
-        "pages=", pages_saved,
-        "errors=", error_count,
+        "date=",
+        race_date,
+        "venues=",
+        active_venues,
+        "pages=",
+        pages_saved,
+        "errors=",
+        error_count,
     )
 
 
