@@ -1,263 +1,276 @@
-import os
-import sqlite3
-
-from boatcast_preview import fetch_preview
-from combined_racer_parser import parse_racelist
-from racer_data_parser import RacerData
+import math
+import re
+from dataclasses import dataclass
+from html.parser import HTMLParser
 
 
-DB = os.environ.get(
-    "DB_PATH",
-    "/data/boatrace_ev.sqlite3",
+REQUIRED_FIELDS = (
+    "racer_win_rate",
+    "motor_2rate",
+    "exhibition_time",
+    "average_st",
 )
 
-MAX_RACES = 12
+
+@dataclass(frozen=True)
+class RacerData:
+    number: int
+    racer_win_rate: float
+    motor_2rate: float
+    exhibition_time: float
+    average_st: float
+    course: int
 
 
-def get_latest_races():
-    with sqlite3.connect(DB) as con:
-        row = con.execute(
-            """
-            SELECT MAX(race_date)
-            FROM market_snapshots
-            WHERE snapshot_type='beforeinfo'
-            """
-        ).fetchone()
+class RacerTableParser(HTMLParser):
+    def __init__(self):
+        super().__init__()
+        self.rows = []
+        self.row = None
+        self.cell = None
+        self.parts = []
 
-        if not row or not row[0]:
-            return None, []
+    def handle_starttag(self, tag, attrs):
+        if tag == "tr":
+            self.row = []
 
-        race_date = row[0]
+        elif tag in ("td", "th") and self.row is not None:
+            self.cell = tag
+            self.parts = []
 
-        rows = con.execute(
-            """
-            SELECT
-                m.venue_code,
-                m.venue_name,
-                m.race_no,
-                r.raw_html
-            FROM market_snapshots AS m
+    def handle_data(self, data):
+        if self.cell is not None:
+            self.parts.append(data)
 
-            INNER JOIN race_pages AS r
-                ON r.race_date = m.race_date
-                AND r.venue_code = m.venue_code
-                AND r.race_no = m.race_no
-
-            WHERE m.race_date = ?
-              AND m.snapshot_type = 'beforeinfo'
-              AND m.pre_deadline = 1
-              AND m.category != 'female'
-
-              AND m.id = (
-                  SELECT MAX(m2.id)
-                  FROM market_snapshots AS m2
-                  WHERE m2.race_date = m.race_date
-                    AND m2.venue_code = m.venue_code
-                    AND m2.race_no = m.race_no
-                    AND m2.snapshot_type = 'beforeinfo'
-                    AND m2.pre_deadline = 1
-              )
-
-              AND r.fetched_at = (
-                  SELECT MAX(r2.fetched_at)
-                  FROM race_pages AS r2
-                  WHERE r2.race_date = r.race_date
-                    AND r2.venue_code = r.venue_code
-                    AND r2.race_no = r.race_no
-              )
-
-            ORDER BY m.id DESC
-            LIMIT ?
-            """,
-            (
-                race_date,
-                MAX_RACES,
-            ),
-        ).fetchall()
-
-    return race_date, rows
-
-
-def build_boats(
-    racelist,
-    preview,
-):
-    exhibition = preview[
-        "exhibition"
-    ]
-
-    courses = preview[
-        "courses"
-    ]
-
-    active = sorted(
-        set(racelist)
-        & set(exhibition)
-        & set(courses)
-    )
-
-    if len(active) not in (
-        5,
-        6,
-    ):
-        return []
-
-    boats = []
-
-    for number in active:
-        base = racelist[number]
-
-        boats.append(
-            RacerData(
-                number=number,
-                racer_win_rate=base[
-                    "racer_win_rate"
-                ],
-                motor_2rate=base[
-                    "motor_2rate"
-                ],
-                exhibition_time=(
-                    exhibition[number]
-                ),
-                average_st=base[
-                    "average_st"
-                ],
-                course=courses[number],
+    def handle_endtag(self, tag):
+        if tag in ("td", "th") and self.cell == tag:
+            self.row.append(
+                " ".join(self.parts).strip()
             )
-        )
+            self.cell = None
+            self.parts = []
 
-    return boats
+        elif tag == "tr" and self.row is not None:
+            if self.row:
+                self.rows.append(self.row)
+
+            self.row = None
 
 
-def main():
-    print(
-        "BOATCAST_PROBE_START",
-        "db=",
-        DB,
-        flush=True,
+def to_number(value):
+    if not isinstance(value, str):
+        return None
+
+    cleaned = (
+        value.strip()
+        .replace("%", "")
     )
+
+    if cleaned in ("", "-", "--", "欠場"):
+        return None
 
     try:
-        race_date, rows = get_latest_races()
+        number = float(cleaned)
+    except ValueError:
+        return None
 
-    except sqlite3.Error as error:
-        print(
-            "BOATCAST_PROBE_DB_ERROR",
-            str(error)[:200],
-            flush=True,
-        )
-        return
+    if not math.isfinite(number):
+        return None
 
-    if not race_date:
-        print(
-            "BOATCAST_PROBE_NO_DATA",
-            flush=True,
-        )
-        return
+    return number
 
-    ready = 0
-    skipped = 0
-    sample_printed = False
 
-    for (
-        venue_code,
-        venue_name,
-        race_no,
-        racelist_html,
-    ) in rows:
+def normalize_header(value):
+    return re.sub(
+        r"\s+",
+        "",
+        value,
+    )
 
-        racelist = parse_racelist(
-            racelist_html
-        )
 
-        preview = fetch_preview(
-            race_date,
-            venue_code,
-            race_no,
-        )
+HEADER_ALIASES = {
+    "艇番": "number",
+    "枠番": "number",
+    "全国勝率": "racer_win_rate",
+    "勝率": "racer_win_rate",
+    "モーター2連対率": "motor_2rate",
+    "モーター2連率": "motor_2rate",
+    "展示タイム": "exhibition_time",
+    "展示": "exhibition_time",
+    "平均ST": "average_st",
+    "平均スタート": "average_st",
+    "進入コース": "course",
+    "コース": "course",
+}
+
+
+def parse_racer_data(html):
+    if not isinstance(html, str):
+        raise ValueError("HTML must be text")
+
+    parser = RacerTableParser()
+    parser.feed(html)
+
+    required = {
+        "number",
+        *REQUIRED_FIELDS,
+    }
+
+    candidates = []
+
+    for index, row in enumerate(parser.rows):
+
+        headers = [
+            HEADER_ALIASES.get(
+                normalize_header(cell)
+            )
+            for cell in row
+        ]
+
+        mapping = {
+            name: position
+            for position, name
+            in enumerate(headers)
+            if name is not None
+        }
+
+        if not required.issubset(mapping):
+            continue
 
         boats = []
+        seen = set()
 
-        if preview["status"] == "READY":
-            boats = build_boats(
-                racelist,
-                preview,
+        for data_row in parser.rows[index + 1:]:
+
+            if len(data_row) != len(row):
+                break
+
+            number_value = to_number(
+                data_row[mapping["number"]]
             )
 
-        if len(boats) in (
-            5,
-            6,
-        ):
-            ready += 1
-            status = "READY_FOR_MODEL"
+            if (
+                number_value is None
+                or not number_value.is_integer()
+                or not 1 <= number_value <= 6
+            ):
+                break
 
-        else:
-            skipped += 1
-            status = "SKIP"
+            number = int(number_value)
 
-        print(
-            "BOATCAST_RACE",
-            venue_name,
-            f"{race_no}R",
-            status,
-            "racers=",
-            len(racelist),
-            "exhibition=",
-            len(
-                preview["exhibition"]
-            ),
-            "courses=",
-            len(
-                preview["courses"]
-            ),
-            "reason=",
-            preview["reason"],
-            flush=True,
-        )
-
-        if (
-            status == "READY_FOR_MODEL"
-            and not sample_printed
-        ):
-            print(
-                "BOATCAST_SAMPLE",
-                venue_name,
-                f"{race_no}R",
-                flush=True,
-            )
-
-            for boat in boats:
-                print(
-                    "BOAT",
-                    boat.number,
-                    "win=",
-                    boat.racer_win_rate,
-                    "motor=",
-                    boat.motor_2rate,
-                    "exhibition=",
-                    boat.exhibition_time,
-                    "avgST=",
-                    boat.average_st,
-                    "course=",
-                    boat.course,
-                    flush=True,
+            if number in seen:
+                raise ValueError(
+                    "Duplicate boat number"
                 )
 
-            sample_printed = True
+            seen.add(number)
 
-    print(
-        "BOATCAST_PROBE_DONE",
-        "date=",
-        race_date,
-        "checked=",
-        len(rows),
-        "ready=",
-        ready,
-        "skipped=",
-        skipped,
-        flush=True,
+            values = {}
+
+            for field in REQUIRED_FIELDS:
+                value = to_number(
+                    data_row[mapping[field]]
+                )
+
+                if value is None:
+                    return []
+
+                values[field] = value
+
+            course = number
+
+            if "course" in mapping:
+                course_value = to_number(
+                    data_row[mapping["course"]]
+                )
+
+                if (
+                    course_value is None
+                    or not course_value.is_integer()
+                    or not 1 <= course_value <= 6
+                ):
+                    return []
+
+                course = int(course_value)
+
+            if not (
+                0 <= values["racer_win_rate"] <= 10
+                and 0 <= values["motor_2rate"] <= 100
+                and 5 <= values["exhibition_time"] <= 10
+                and 0 <= values["average_st"] <= 1
+            ):
+                return []
+
+            boats.append(
+                RacerData(
+                    number=number,
+                    racer_win_rate=values[
+                        "racer_win_rate"
+                    ],
+                    motor_2rate=values[
+                        "motor_2rate"
+                    ],
+                    exhibition_time=values[
+                        "exhibition_time"
+                    ],
+                    average_st=values[
+                        "average_st"
+                    ],
+                    course=course,
+                )
+            )
+
+        if boats:
+            candidates.append(boats)
+
+    if len(candidates) != 1:
+        return []
+
+    boats = candidates[0]
+
+    if len(boats) not in (5, 6):
+        return []
+
+    if len({
+        boat.course
+        for boat in boats
+    }) != len(boats):
+        return []
+
+    return sorted(
+        boats,
+        key=lambda boat: boat.number,
     )
+
+
+def evaluate_data_readiness(html):
+    try:
+        boats = parse_racer_data(html)
+
+    except (ValueError, TypeError):
+        return {
+            "status": "SKIP",
+            "reason": "INVALID_RACER_DATA",
+            "boats": [],
+        }
+
+    if not boats:
+        return {
+            "status": "SKIP",
+            "reason":
+                "MISSING_OR_INCOMPLETE_DATA",
+            "boats": [],
+        }
+
+    return {
+        "status": "READY_FOR_VALIDATION",
+        "reason":
+            "STRUCTURED_DATA_EXTRACTED",
+        "boats": boats,
+    }
 
 
 if __name__ == "__main__":
-    main()
+    print(
+        "RACER_DATA_PARSER_READY"
+    )
