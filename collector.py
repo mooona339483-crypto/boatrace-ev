@@ -38,54 +38,150 @@ VENUES = {
     "24": "大村",
 }
 
-FEMALE_KEYWORDS = (
+FEMALE_TITLE_KEYWORDS = (
     "オールレディース",
     "ヴィーナスシリーズ",
+    "ヴィーナスＳ",
     "レディースチャンピオン",
     "レディースオールスター",
+    "レディースチャレンジカップ",
     "クイーンズクライマックス",
 )
 
 BASE = "https://www.boatrace.jp/owpc/pc/race/racelist"
 
 
-class TextParser(HTMLParser):
+class PageParser(HTMLParser):
+    VOID_TAGS = {
+        "area",
+        "base",
+        "br",
+        "col",
+        "embed",
+        "hr",
+        "img",
+        "input",
+        "link",
+        "meta",
+        "param",
+        "source",
+        "track",
+        "wbr",
+    }
+
     def __init__(self):
         super().__init__()
         self.parts = []
+        self.title_parts = []
+        self.title_depth = 0
+
+    def handle_starttag(self, tag, attrs):
+        attrs = dict(attrs)
+
+        if self.title_depth > 0:
+            if tag not in self.VOID_TAGS:
+                self.title_depth += 1
+            return
+
+        classes = (
+            attrs.get("class", "")
+            .strip()
+            .split()
+        )
+
+        if any(
+            "heading2_title" in cls
+            for cls in classes
+        ):
+            self.title_depth = 1
 
     def handle_data(self, data):
         text = data.strip()
-        if text:
-            self.parts.append(text)
+
+        if not text:
+            return
+
+        self.parts.append(text)
+
+        if self.title_depth > 0:
+            self.title_parts.append(text)
+
+    def handle_endtag(self, tag):
+        if self.title_depth > 0:
+            self.title_depth -= 1
 
     def get_text(self):
         return " ".join(self.parts)
 
+    def get_event_title(self):
+        return " ".join(
+            self.title_parts
+        ).strip()
 
-def html_to_text(html):
-    p = TextParser()
-    p.feed(html)
-    return p.get_text()
+
+def parse_page(html):
+    parser = PageParser()
+    parser.feed(html)
+
+    return (
+        parser.get_text(),
+        parser.get_event_title(),
+    )
 
 
 def fetch(url):
     req = urllib.request.Request(
         url,
         headers={
-            "User-Agent": "Mozilla/5.0 boatrace-ev-research/1.0",
-            "Accept-Language": "ja-JP,ja;q=0.9",
+            "User-Agent":
+                "Mozilla/5.0 boatrace-ev-research/1.0",
+            "Accept-Language":
+                "ja-JP,ja;q=0.9",
         },
     )
 
-    with urllib.request.urlopen(req, timeout=20) as res:
-        charset = res.headers.get_content_charset() or "utf-8"
-        return res.read().decode(charset, errors="replace")
+    with urllib.request.urlopen(
+        req,
+        timeout=20,
+    ) as res:
+        charset = (
+            res.headers.get_content_charset()
+            or "utf-8"
+        )
+
+        return res.read().decode(
+            charset,
+            errors="replace",
+        )
 
 
-def detect_category(text):
-    for keyword in FEMALE_KEYWORDS:
-        if keyword in text:
+def normalize_title(title):
+    return (
+        title
+        .replace(" ", "")
+        .replace("　", "")
+        .upper()
+    )
+
+
+def detect_category(event_title):
+    title = normalize_title(event_title)
+
+    if not title:
+        return "mixed"
+
+    if (
+        title.startswith("ＡＬ・")
+        or title.startswith("AL・")
+    ):
+        return "female"
+
+    for keyword in FEMALE_TITLE_KEYWORDS:
+        normalized_keyword = (
+            normalize_title(keyword)
+        )
+
+        if normalized_keyword in title:
             return "female"
 
     return "mixed"
@@ -93,7 +189,8 @@ def detect_category(text):
 
 def extract_deadlines(text):
     m = re.search(
-        r"締切予定時刻\s+((?:\d{1,2}:\d{2}\s*){12})",
+        r"締切予定時刻\s+"
+        r"((?:\d{1,2}:\d{2}\s*){12})",
         text,
     )
 
@@ -225,7 +322,11 @@ def collect(race_date=None):
 
         try:
             html = fetch(check_url)
-            text = html_to_text(html)
+
+            (
+                text,
+                event_title,
+            ) = parse_page(html)
 
             if (
                 "締切予定時刻" not in text
@@ -239,14 +340,21 @@ def collect(race_date=None):
 
             active_venues += 1
 
-            category = detect_category(text)
-            deadlines = extract_deadlines(text)
+            category = detect_category(
+                event_title
+            )
+
+            deadlines = extract_deadlines(
+                text
+            )
 
             print(
                 "ACTIVE",
                 venue_code,
                 venue_name,
                 category,
+                "TITLE=",
+                event_title,
             )
 
             for race_no in range(1, 13):
@@ -260,7 +368,8 @@ def collect(race_date=None):
                     race_html = fetch(url)
 
                     fetched_at = (
-                        datetime.datetime.now(JST)
+                        datetime.datetime
+                        .now(JST)
                         .isoformat()
                     )
 
@@ -320,7 +429,8 @@ def collect(race_date=None):
         time.sleep(0.5)
 
     finished_at = (
-        datetime.datetime.now(JST)
+        datetime.datetime
+        .now(JST)
         .isoformat()
     )
 
