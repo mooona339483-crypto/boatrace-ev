@@ -178,28 +178,29 @@ def get_checkpoint_pairs():
 
 def already_recorded(
     race_id,
+    bet_type,
     checkpoint,
 ):
     with connect() as con:
         row = con.execute(
             """
-            SELECT COUNT(*)
+            SELECT 1
             FROM shadow_prediction_records
             WHERE race_id=?
+              AND bet_type=?
               AND checkpoint_minutes=?
               AND model_version=?
+            LIMIT 1
             """,
             (
                 race_id,
+                bet_type,
                 checkpoint,
                 MODEL_VERSION,
             ),
         ).fetchone()
 
-    return (
-        row is not None
-        and row[0] >= 2
-    )
+    return row is not None
 
 
 def get_race_info(
@@ -261,9 +262,58 @@ def load_odds(
     }
 
 
+def active_boats_from_odds(
+    odds_map,
+):
+    active = set()
+
+    for selection in odds_map:
+        parts = selection.split("-")
+
+        for value in parts:
+            try:
+                number = int(value)
+            except ValueError:
+                continue
+
+            if 1 <= number <= 6:
+                active.add(number)
+
+    if len(active) not in (
+        5,
+        6,
+    ):
+        return []
+
+    return sorted(active)
+
+
+def expected_count(
+    boat_count,
+    bet_type,
+):
+    if bet_type == "2T":
+        return (
+            boat_count
+            * (boat_count - 1)
+        )
+
+    if bet_type == "3T":
+        return (
+            boat_count
+            * (boat_count - 1)
+            * (boat_count - 2)
+        )
+
+    raise ValueError(
+        "Invalid bet type"
+    )
+
+
 def build_boats(
     racelist,
     preview,
+    active_numbers,
 ):
     exhibition = preview[
         "exhibition"
@@ -273,21 +323,27 @@ def build_boats(
         "courses"
     ]
 
-    active = sorted(
-        set(racelist)
-        & set(exhibition)
-        & set(courses)
+    active_numbers = sorted(
+        active_numbers
     )
 
-    if len(active) not in (
+    if len(active_numbers) not in (
         5,
         6,
     ):
         return []
 
+    for number in active_numbers:
+        if (
+            number not in racelist
+            or number not in exhibition
+            or number not in courses
+        ):
+            return []
+
     course_values = [
         courses[number]
-        for number in active
+        for number in active_numbers
     ]
 
     if (
@@ -298,7 +354,7 @@ def build_boats(
 
     boats = []
 
-    for number in active:
+    for number in active_numbers:
         data = racelist[number]
 
         boats.append(
@@ -341,6 +397,25 @@ def build_payload(
             bet_type,
         )
     )
+
+    boat_count = len(
+        boats
+    )
+
+    expected = expected_count(
+        boat_count,
+        bet_type,
+    )
+
+    if len(odds_map) != expected:
+        raise ValueError(
+            "Incomplete odds map"
+        )
+
+    if len(probabilities) != expected:
+        raise ValueError(
+            "Incomplete probability map"
+        )
 
     if (
         set(probabilities)
@@ -474,6 +549,114 @@ def save_shadow(
         )
 
 
+def record_one(
+    *,
+    row,
+    race_info,
+    racelist,
+    preview,
+    bet_type,
+    snapshot_id,
+    actual_minutes,
+    captured_at,
+):
+    race_id = row[
+        "race_id"
+    ]
+
+    checkpoint = row[
+        "checkpoint_minutes"
+    ]
+
+    if already_recorded(
+        race_id,
+        bet_type,
+        checkpoint,
+    ):
+        return "EXISTS", 0
+
+    odds_map = load_odds(
+        snapshot_id,
+        bet_type,
+    )
+
+    active_numbers = (
+        active_boats_from_odds(
+            odds_map
+        )
+    )
+
+    if len(active_numbers) not in (
+        5,
+        6,
+    ):
+        raise ValueError(
+            "Invalid active boat count"
+        )
+
+    boats = build_boats(
+        racelist,
+        preview,
+        active_numbers,
+    )
+
+    if (
+        len(boats)
+        != len(active_numbers)
+    ):
+        raise ValueError(
+            "Incomplete active boat data"
+        )
+
+    selections = build_payload(
+        boats,
+        odds_map,
+        bet_type,
+    )
+
+    save_shadow(
+        race_id=race_id,
+        race_date=row[
+            "race_date"
+        ],
+        venue_code=row[
+            "venue_code"
+        ],
+        race_no=row[
+            "race_no"
+        ],
+        race_category=(
+            race_info[
+                "category"
+            ]
+        ),
+        deadline=(
+            race_info[
+                "deadline"
+            ]
+        ),
+        bet_type=bet_type,
+        checkpoint=checkpoint,
+        actual_minutes=(
+            actual_minutes
+        ),
+        snapshot_id=(
+            snapshot_id
+        ),
+        odds_captured_at=(
+            captured_at
+        ),
+        selections=(
+            selections
+        ),
+    )
+
+    return (
+        "SAVED",
+        len(selections),
+    )
+
+
 def record_ready_predictions():
     init_db()
 
@@ -494,12 +677,6 @@ def record_ready_predictions():
         ]
 
         if checkpoint not in CHECKPOINTS:
-            continue
-
-        if already_recorded(
-            race_id,
-            checkpoint,
-        ):
             continue
 
         race_info = get_race_info(
@@ -542,17 +719,7 @@ def record_ready_predictions():
 
                 continue
 
-            boats = build_boats(
-                racelist,
-                preview,
-            )
-
-            if len(boats) not in (
-                5,
-                6,
-            ):
-                skipped += 1
-                continue
+            results = []
 
             configs = (
                 (
@@ -576,81 +743,76 @@ def record_ready_predictions():
                 captured_at,
             ) in configs:
 
-                odds_map = load_odds(
-                    snapshot_id,
-                    bet_type,
-                )
+                try:
+                    status, count = record_one(
+                        row=row,
+                        race_info=(
+                            race_info
+                        ),
+                        racelist=(
+                            racelist
+                        ),
+                        preview=(
+                            preview
+                        ),
+                        bet_type=(
+                            bet_type
+                        ),
+                        snapshot_id=(
+                            snapshot_id
+                        ),
+                        actual_minutes=(
+                            actual_minutes
+                        ),
+                        captured_at=(
+                            captured_at
+                        ),
+                    )
 
-                selections = (
-                    build_payload(
-                        boats,
-                        odds_map,
+                    results.append(
+                        (
+                            bet_type,
+                            status,
+                            count,
+                        )
+                    )
+
+                    if status == "SAVED":
+                        saved += 1
+
+                except Exception as error:
+                    errors += 1
+
+                    print(
+                        "SHADOW_BET_ERROR",
+                        race_id,
                         bet_type,
+                        "checkpoint=",
+                        checkpoint,
+                        type(error).__name__,
+                        str(error)[:160],
+                        flush=True,
                     )
+
+            if any(
+                status == "SAVED"
+                for (
+                    _,
+                    status,
+                    _,
+                ) in results
+            ):
+                print(
+                    "SHADOW_RECORDED",
+                    race_id,
+                    "checkpoint=",
+                    checkpoint,
+                    "details=",
+                    results,
+                    "verified=",
+                    False,
+                    flush=True,
                 )
-
-                save_shadow(
-                    race_id=race_id,
-                    race_date=row[
-                        "race_date"
-                    ],
-                    venue_code=row[
-                        "venue_code"
-                    ],
-                    race_no=row[
-                        "race_no"
-                    ],
-                    race_category=(
-                        race_info[
-                            "category"
-                        ]
-                    ),
-                    deadline=(
-                        race_info[
-                            "deadline"
-                        ]
-                    ),
-                    bet_type=bet_type,
-                    checkpoint=checkpoint,
-                    actual_minutes=(
-                        actual_minutes
-                    ),
-                    snapshot_id=(
-                        snapshot_id
-                    ),
-                    odds_captured_at=(
-                        captured_at
-                    ),
-                    selections=(
-                        selections
-                    ),
-                )
-
-                saved += 1
-
-            print(
-                "SHADOW_RECORDED",
-                race_id,
-                "checkpoint=",
-                checkpoint,
-                "2T=",
-                len(
-                    load_odds(
-                        row["snapshot_2t"],
-                        "2T",
-                    )
-                ),
-                "3T=",
-                len(
-                    load_odds(
-                        row["snapshot_3t"],
-                        "3T",
-                    )
-                ),
-                "verified=",
-                False,
-                flush=True,
-            )
 
         except Exception as error:
             errors += 1
