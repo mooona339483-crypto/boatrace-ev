@@ -1,3 +1,4 @@
+
 import re
 import urllib.error
 import urllib.request
@@ -45,7 +46,8 @@ def fetch_text(url):
             request,
             timeout=20,
         ) as response:
-            body = response.read().decode(
+            raw = response.read()
+            body = raw.decode(
                 "utf-8",
                 errors="replace",
             )
@@ -55,6 +57,8 @@ def fetch_text(url):
             "FETCH_HTTP_ERROR",
             error.code,
             url,
+            "reason=", str(error.reason),
+            "headers=", dict(error.headers),
             flush=True,
         )
         return None
