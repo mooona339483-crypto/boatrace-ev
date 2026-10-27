@@ -12,6 +12,11 @@ MODEL_VERSION = "heuristic-v1"
 
 STAKE_PER_SELECTION = 100
 
+MIN_PROBABILITY = {
+    "2T": 0.12,
+    "3T": 0.08,
+}
+
 MAX_SELECTIONS = {
     "2T": 5,
     "3T": 8,
@@ -104,36 +109,105 @@ def winner_and_payout(
     )
 
 
+def candidate_score(
+    probability,
+    ev,
+):
+    return (
+        ev * 0.60
+        + probability * 0.40
+    )
+
+
 def select_candidates(
     selections,
     bet_type,
     min_ev,
 ):
-    candidates = [
-        item
-        for item in selections
-        if (
-            isinstance(
-                item.get("ev"),
-                (int, float),
-            )
-            and item["ev"] >= min_ev
-        )
-    ]
+    min_probability = (
+        MIN_PROBABILITY[
+            bet_type
+        ]
+    )
 
-    candidates.sort(
-        key=lambda item: (
-            -item["ev"],
-            -item["probability"],
-            item["selection"],
+    valid = []
+
+    for item in selections:
+
+        probability = item.get(
+            "probability"
+        )
+
+        ev = item.get(
+            "ev"
+        )
+
+        selection = item.get(
+            "selection"
+        )
+
+        if not isinstance(
+            probability,
+            (int, float),
+        ):
+            continue
+
+        if not isinstance(
+            ev,
+            (int, float),
+        ):
+            continue
+
+        if not isinstance(
+            selection,
+            str,
+        ):
+            continue
+
+        if (
+            probability
+            < min_probability
+        ):
+            continue
+
+        if ev < min_ev:
+            continue
+
+        score = candidate_score(
+            probability,
+            ev,
+        )
+
+        valid.append(
+            (
+                item,
+                score,
+            )
+        )
+
+    valid.sort(
+        key=lambda pair: (
+            -pair[1],
+            -pair[0]["ev"],
+            -pair[0][
+                "probability"
+            ],
+            pair[0][
+                "selection"
+            ],
         )
     )
 
-    return candidates[
-        :MAX_SELECTIONS[
-            bet_type
+    selected = [
+        pair[0]
+        for pair in valid[
+            :MAX_SELECTIONS[
+                bet_type
+            ]
         ]
     ]
+
+    return selected
 
 
 def evaluate_group(
@@ -154,21 +228,29 @@ def evaluate_group(
     total_probability = 0.0
     total_ev = 0.0
 
+    race_profits = []
+
     for row in rows:
 
         if (
-            row["checkpoint_minutes"]
+            row[
+                "checkpoint_minutes"
+            ]
             != checkpoint
         ):
             continue
 
-        if row["bet_type"] != bet_type:
+        if (
+            row["bet_type"]
+            != bet_type
+        ):
             continue
 
-        winner, payout = (
-            winner_and_payout(
-                row
-            )
+        (
+            winner,
+            payout,
+        ) = winner_and_payout(
+            row
         )
 
         if (
@@ -181,8 +263,11 @@ def evaluate_group(
 
         try:
             selections = json.loads(
-                row["selections_json"]
+                row[
+                    "selections_json"
+                ]
             )
+
         except (
             TypeError,
             ValueError,
@@ -203,6 +288,8 @@ def evaluate_group(
 
         races_with_bets += 1
 
+        race_stake = 0
+        race_payout = 0
         race_hit = False
 
         for item in selected:
@@ -213,8 +300,14 @@ def evaluate_group(
                 STAKE_PER_SELECTION
             )
 
+            race_stake += (
+                STAKE_PER_SELECTION
+            )
+
             total_probability += (
-                item["probability"]
+                item[
+                    "probability"
+                ]
             )
 
             total_ev += (
@@ -227,7 +320,7 @@ def evaluate_group(
             ):
                 race_hit = True
 
-                total_payout += int(
+                received = int(
                     round(
                         STAKE_PER_SELECTION
                         / 100
@@ -235,8 +328,21 @@ def evaluate_group(
                     )
                 )
 
+                total_payout += (
+                    received
+                )
+
+                race_payout += (
+                    received
+                )
+
         if race_hit:
             hit_races += 1
+
+        race_profits.append(
+            race_payout
+            - race_stake
+        )
 
     profit = (
         total_payout
@@ -278,6 +384,13 @@ def evaluate_group(
         else None
     )
 
+    average_selections = (
+        total_selections
+        / races_with_bets
+        if races_with_bets
+        else None
+    )
+
     return {
         "checkpoint":
             checkpoint,
@@ -288,6 +401,11 @@ def evaluate_group(
         "min_ev":
             min_ev,
 
+        "min_probability":
+            MIN_PROBABILITY[
+                bet_type
+            ],
+
         "available_races":
             available_races,
 
@@ -296,6 +414,9 @@ def evaluate_group(
 
         "selections":
             total_selections,
+
+        "average_selections":
+            average_selections,
 
         "hit_races":
             hit_races,
@@ -391,8 +512,16 @@ def run():
                     checkpoint,
                     "bet=",
                     bet_type,
+                    "minProb=",
+                    format_percent(
+                        result[
+                            "min_probability"
+                        ]
+                    ),
                     "minEV=",
-                    f"{min_ev:.2f}",
+                    format_percent(
+                        min_ev
+                    ),
                     "available=",
                     result[
                         "available_races"
@@ -471,11 +600,25 @@ def run():
         print(
             "TOP",
             "checkpoint=",
-            result["checkpoint"],
+            result[
+                "checkpoint"
+            ],
             "bet=",
-            result["bet_type"],
+            result[
+                "bet_type"
+            ],
+            "minProb=",
+            format_percent(
+                result[
+                    "min_probability"
+                ]
+            ),
             "minEV=",
-            f"{result['min_ev']:.2f}",
+            format_percent(
+                result[
+                    "min_ev"
+                ]
+            ),
             "races=",
             result[
                 "races_with_bets"
@@ -484,8 +627,22 @@ def run():
             format_percent(
                 result["roi"]
             ),
+            "hit_rate=",
+            format_percent(
+                result[
+                    "hit_rate"
+                ]
+            ),
+            "coverage=",
+            format_percent(
+                result[
+                    "coverage"
+                ]
+            ),
             "profit=",
-            result["profit"],
+            result[
+                "profit"
+            ],
             flush=True,
         )
 
