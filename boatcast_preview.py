@@ -1,10 +1,13 @@
-
 import re
+import time
 import urllib.error
 import urllib.request
 
 
 BASE = "https://race.boatcast.jp"
+
+TIMEOUT = 20
+MAX_RETRIES = 3
 
 
 def normalize_date(value):
@@ -27,68 +30,73 @@ def build_url(kind, race_date, venue_code, race_no):
         f"{venue_code}_{race_no}.txt"
     )
 
-    return (
-        f"{BASE}/hp_txt/"
-        f"{venue_code}/{filename}"
-    )
+    return f"{BASE}/hp_txt/{venue_code}/{filename}"
 
 
 def fetch_text(url):
-    request = urllib.request.Request(
-        url,
-        headers={
-            "User-Agent": "Mozilla/5.0 boatrace-ev/1.0",
-        },
-    )
+    headers = {
+        "User-Agent": "Mozilla/5.0 (compatible; boatrace-ev/1.0)",
+        "Accept": "text/plain,*/*",
+    }
 
-    try:
-        with urllib.request.urlopen(
-            request,
-            timeout=20,
-        ) as response:
-            raw = response.read()
-            body = raw.decode(
-                "utf-8",
-                errors="replace",
+    for attempt in range(1, MAX_RETRIES + 1):
+        request = urllib.request.Request(
+            url,
+            headers=headers,
+        )
+
+        try:
+            with urllib.request.urlopen(
+                request,
+                timeout=TIMEOUT,
+            ) as response:
+                raw = response.read()
+                body = raw.decode(
+                    "utf-8",
+                    errors="replace",
+                )
+
+            if body.lstrip().startswith("<"):
+                print(
+                    "FETCH_HTML_RESPONSE",
+                    url,
+                    flush=True,
+                )
+                return None
+
+            return body
+
+        except urllib.error.HTTPError as error:
+            print(
+                "FETCH_HTTP_ERROR",
+                "status=", error.code,
+                "attempt=", attempt,
+                "url=", url,
+                "reason=", str(error.reason),
+                flush=True,
             )
 
-    except urllib.error.HTTPError as error:
-        print(
-            "FETCH_HTTP_ERROR",
-            error.code,
-            url,
-            "reason=", str(error.reason),
-            "headers=", dict(error.headers),
-            flush=True,
-        )
-        return None
+            # Access denied: do not repeatedly request.
+            if error.code in (401, 403, 404):
+                return None
 
-    except urllib.error.URLError as error:
-        print(
-            "FETCH_URL_ERROR",
-            str(error.reason),
-            url,
-            flush=True,
-        )
-        return None
+            if error.code not in (408, 429, 500, 502, 503, 504):
+                return None
 
-    except TimeoutError:
-        print(
-            "FETCH_TIMEOUT",
-            url,
-            flush=True,
-        )
-        return None
+        except (urllib.error.URLError, TimeoutError) as error:
+            print(
+                "FETCH_CONNECTION_ERROR",
+                "attempt=", attempt,
+                "url=", url,
+                "error=", str(error),
+                flush=True,
+            )
 
-    if body.lstrip().startswith("<"):
-        print(
-            "FETCH_HTML_RESPONSE",
-            url,
-            flush=True,
-        )
-        return None
+        if attempt < MAX_RETRIES:
+            time.sleep(attempt * 2)
 
-    return body
+    print("FETCH_FAILED", url, flush=True)
+    return None
 
 
 def to_float(value):
@@ -115,10 +123,7 @@ def parse_tkz(body):
 
     lines = body.splitlines()
 
-    if (
-        not lines
-        or not lines[0].lstrip().startswith("data=")
-    ):
+    if not lines or not lines[0].lstrip().startswith("data="):
         return None, {}
 
     if len(lines) < 2:
@@ -179,10 +184,7 @@ def parse_stt(body):
 
     lines = body.splitlines()
 
-    if (
-        not lines
-        or not lines[0].lstrip().startswith("data=")
-    ):
+    if not lines or not lines[0].lstrip().startswith("data="):
         return {}, {}
 
     courses = {}
@@ -211,11 +213,7 @@ def parse_stt(body):
 
         courses[boat_number] = course
 
-        flag = (
-            columns[5]
-            if len(columns) > 5
-            else ""
-        )
+        flag = columns[5] if len(columns) > 5 else ""
 
         start_timing[boat_number] = parse_start_timing(
             columns[4],
