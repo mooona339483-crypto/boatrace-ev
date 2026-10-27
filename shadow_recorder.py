@@ -268,9 +268,7 @@ def active_boats_from_odds(
     active = set()
 
     for selection in odds_map:
-        parts = selection.split("-")
-
-        for value in parts:
+        for value in selection.split("-"):
             try:
                 number = int(value)
             except ValueError:
@@ -360,23 +358,18 @@ def build_boats(
         boats.append(
             Boat(
                 number=number,
-
                 racer_win_rate=data[
                     "racer_win_rate"
                 ],
-
                 motor_2rate=data[
                     "motor_2rate"
                 ],
-
                 exhibition_time=(
                     exhibition[number]
                 ),
-
                 average_st=data[
                     "average_st"
                 ],
-
                 course=courses[
                     number
                 ],
@@ -450,19 +443,16 @@ def build_payload(
             {
                 "selection":
                     selection,
-
                 "probability":
                     round(
                         probability,
                         8,
                     ),
-
                 "odds":
                     round(
                         odds,
                         2,
                     ),
-
                 "ev":
                     round(
                         ev,
@@ -573,7 +563,10 @@ def record_one(
         bet_type,
         checkpoint,
     ):
-        return "EXISTS", 0
+        return (
+            "EXISTS",
+            0,
+        )
 
     odds_map = load_odds(
         snapshot_id,
@@ -590,8 +583,9 @@ def record_one(
         5,
         6,
     ):
-        raise ValueError(
-            "Invalid active boat count"
+        return (
+            "SKIP_INVALID_ACTIVE_BOATS",
+            0,
         )
 
     boats = build_boats(
@@ -604,15 +598,25 @@ def record_one(
         len(boats)
         != len(active_numbers)
     ):
-        raise ValueError(
-            "Incomplete active boat data"
+        return (
+            "SKIP_INCOMPLETE_DATA",
+            0,
         )
 
-    selections = build_payload(
-        boats,
-        odds_map,
-        bet_type,
-    )
+    try:
+        selections = (
+            build_payload(
+                boats,
+                odds_map,
+                bet_type,
+            )
+        )
+
+    except ValueError:
+        return (
+            "SKIP_ODDS_MISMATCH",
+            0,
+        )
 
     save_shadow(
         race_id=race_id,
@@ -744,7 +748,10 @@ def record_ready_predictions():
             ) in configs:
 
                 try:
-                    status, count = record_one(
+                    (
+                        status,
+                        count,
+                    ) = record_one(
                         row=row,
                         race_info=(
                             race_info
@@ -780,6 +787,11 @@ def record_ready_predictions():
                     if status == "SAVED":
                         saved += 1
 
+                    elif status.startswith(
+                        "SKIP"
+                    ):
+                        skipped += 1
+
                 except Exception as error:
                     errors += 1
 
@@ -794,16 +806,9 @@ def record_ready_predictions():
                         flush=True,
                     )
 
-            if any(
-                status == "SAVED"
-                for (
-                    _,
-                    status,
-                    _,
-                ) in results
-            ):
+            if results:
                 print(
-                    "SHADOW_RECORDED",
+                    "SHADOW_RESULT",
                     race_id,
                     "checkpoint=",
                     checkpoint,
