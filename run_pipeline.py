@@ -12,6 +12,7 @@ STEPS = [
     "odds_mapper.py",
     "racer_data_probe.py",
     "model_probe.py",
+    "result_collector.py",
 ]
 
 
