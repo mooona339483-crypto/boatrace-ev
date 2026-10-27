@@ -318,7 +318,10 @@ def save_market_snapshot(
             cursor.lastrowid
         )
 
-    return snapshot_id, captured_at
+    return (
+        snapshot_id,
+        captured_at,
+    )
 
 
 def save_checkpoint(
@@ -625,7 +628,11 @@ def main():
 
     last_schedule_attempt = 0.0
     last_result_run = 0.0
-    last_backtest_run = 0.0
+
+    last_backtest_run = (
+        time.monotonic()
+        - BACKTEST_INTERVAL_SECONDS
+    )
 
     while True:
         cycle_started = (
