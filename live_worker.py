@@ -39,6 +39,7 @@ CHECKPOINTS = (
 CHECKPOINT_TOLERANCE = 0.65
 
 RESULT_INTERVAL_SECONDS = 300
+BACKTEST_INTERVAL_SECONDS = 1800
 SCHEDULE_RETRY_SECONDS = 1800
 
 
@@ -54,9 +55,7 @@ def connect():
 
 
 def now_jst():
-    return datetime.now(
-        JST
-    )
+    return datetime.now(JST)
 
 
 def today_string():
@@ -169,10 +168,7 @@ def get_today_races():
             ),
         ).fetchall()
 
-    return (
-        race_date,
-        rows,
-    )
+    return race_date, rows
 
 
 def checkpoint_exists(
@@ -322,10 +318,7 @@ def save_market_snapshot(
             cursor.lastrowid
         )
 
-    return (
-        snapshot_id,
-        captured_at,
-    )
+    return snapshot_id, captured_at
 
 
 def save_checkpoint(
@@ -411,13 +404,9 @@ def capture_one(
     )
 
     try:
-        html = fetch(
-            url
-        )
+        html = fetch(url)
 
-        odds_map = parser(
-            html
-        )
+        odds_map = parser(html)
 
         expected = expected_count(
             odds_map,
@@ -454,9 +443,7 @@ def capture_one(
             category=category,
             deadline=deadline,
             snapshot_type=snapshot_type,
-            actual_minutes=(
-                actual_minutes
-            ),
+            actual_minutes=actual_minutes,
             url=url,
             html=html,
         )
@@ -474,9 +461,7 @@ def capture_one(
             race_no=race_no,
             bet_type=bet_type,
             checkpoint=checkpoint,
-            actual_minutes=(
-                actual_minutes
-            ),
+            actual_minutes=actual_minutes,
             snapshot_id=snapshot_id,
             captured_at=captured_at,
         )
@@ -524,11 +509,9 @@ def capture_live_odds():
     saved = 0
 
     for row in races:
-        deadline_dt = (
-            deadline_datetime(
-                race_date,
-                row["deadline"],
-            )
+        deadline_dt = deadline_datetime(
+            race_date,
+            row["deadline"],
         )
 
         if deadline_dt is None:
@@ -544,10 +527,8 @@ def capture_live_odds():
         ):
             continue
 
-        checkpoint = (
-            nearest_checkpoint(
-                minutes
-            )
+        checkpoint = nearest_checkpoint(
+            minutes
         )
 
         if checkpoint is None:
@@ -644,6 +625,7 @@ def main():
 
     last_schedule_attempt = 0.0
     last_result_run = 0.0
+    last_backtest_run = 0.0
 
     while True:
         cycle_started = (
@@ -695,6 +677,19 @@ def main():
 
                 run_script(
                     "result_collector.py"
+                )
+
+            if (
+                cycle_started
+                - last_backtest_run
+                >= BACKTEST_INTERVAL_SECONDS
+            ):
+                last_backtest_run = (
+                    cycle_started
+                )
+
+                run_script(
+                    "shadow_backtest.py"
                 )
 
         except Exception as error:
