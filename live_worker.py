@@ -10,6 +10,7 @@ from market_collector import (
     fetch,
     init_db as init_market_db,
 )
+
 from odds_mapper import (
     init_db as init_odds_db,
     map_2t,
@@ -129,6 +130,7 @@ def deadline_datetime(
             f"{race_date}{deadline}",
             "%Y%m%d%H:%M",
         )
+
     except ValueError:
         return None
 
@@ -210,9 +212,11 @@ def nearest_checkpoint(
                 ),
                 checkpoint,
             )
-            for checkpoint in CHECKPOINTS
+            for checkpoint
+            in CHECKPOINTS
         ),
-        key=lambda item: item[0],
+        key=lambda item:
+            item[0],
     )
 
     distance, checkpoint = (
@@ -520,7 +524,6 @@ def capture_live_odds():
     saved = 0
 
     for row in races:
-
         deadline_dt = (
             deadline_datetime(
                 race_date,
@@ -677,6 +680,10 @@ def main():
                         flush=True,
                     )
 
+                    run_script(
+                        "shadow_recorder.py"
+                    )
+
             if (
                 cycle_started
                 - last_result_run
@@ -705,7 +712,8 @@ def main():
 
         sleep_seconds = max(
             1,
-            POLL_SECONDS - elapsed,
+            POLL_SECONDS
+            - elapsed,
         )
 
         time.sleep(
