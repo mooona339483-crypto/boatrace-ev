@@ -1,11 +1,10 @@
+
 import re
 import time
 import urllib.error
 import urllib.request
 
-
 BASE = "https://race.boatcast.jp"
-
 TIMEOUT = 20
 MAX_RETRIES = 3
 
@@ -29,13 +28,12 @@ def build_url(kind, race_date, venue_code, race_no):
         f"bc_j_{kind}_{race_date}_"
         f"{venue_code}_{race_no}.txt"
     )
-
     return f"{BASE}/hp_txt/{venue_code}/{filename}"
 
 
 def fetch_text(url):
     headers = {
-        "User-Agent": "Mozilla/5.0 (compatible; boatrace-ev/1.0)",
+        "User-Agent": "boatrace-ev/1.0",
         "Accept": "text/plain,*/*",
     }
 
@@ -50,40 +48,94 @@ def fetch_text(url):
                 request,
                 timeout=TIMEOUT,
             ) as response:
-                raw = response.read()
-                body = raw.decode(
-                    "utf-8",
-                    errors="replace",
+                status = response.status
+                content_type = response.headers.get(
+                    "Content-Type", ""
                 )
+                raw = response.read()
 
-            if body.lstrip().startswith("<"):
+            body = raw.decode(
+                "utf-8",
+                errors="replace",
+            )
+
+            if (
+                "text/html" in content_type.lower()
+                or body.lstrip().startswith("<")
+            ):
                 print(
-                    "FETCH_HTML_RESPONSE",
-                    url,
+                    "FETCH_INVALID_CONTENT",
+                    "status=", status,
+                    "content_type=", content_type,
+                    "url=", url,
                     flush=True,
                 )
                 return None
 
+            if not body.strip():
+                print(
+                    "FETCH_EMPTY",
+                    "url=", url,
+                    flush=True,
+                )
+                return None
+
+            print(
+                "FETCH_OK",
+                "bytes=", len(raw),
+                "url=", url,
+                flush=True,
+            )
             return body
 
         except urllib.error.HTTPError as error:
+            code = error.code
+
             print(
                 "FETCH_HTTP_ERROR",
-                "status=", error.code,
+                "status=", code,
                 "attempt=", attempt,
                 "url=", url,
                 "reason=", str(error.reason),
                 flush=True,
             )
 
-            # Access denied: do not repeatedly request.
-            if error.code in (401, 403, 404):
+            if code in (401, 403):
+                print(
+                    "FETCH_ACCESS_DENIED",
+                    "status=", code,
+                    "url=", url,
+                    flush=True,
+                )
                 return None
 
-            if error.code not in (408, 429, 500, 502, 503, 504):
+            if code == 404:
+                print(
+                    "FETCH_NOT_FOUND",
+                    "url=", url,
+                    flush=True,
+                )
                 return None
 
-        except (urllib.error.URLError, TimeoutError) as error:
+            if code not in (
+                408, 429, 500, 502, 503, 504
+            ):
+                return None
+
+            if code == 429:
+                retry_after = error.headers.get(
+                    "Retry-After", ""
+                )
+                print(
+                    "FETCH_RATE_LIMIT",
+                    "retry_after=", retry_after,
+                    flush=True,
+                )
+
+        except (
+            urllib.error.URLError,
+            TimeoutError,
+        ) as error:
             print(
                 "FETCH_CONNECTION_ERROR",
                 "attempt=", attempt,
@@ -123,7 +175,9 @@ def parse_tkz(body):
 
     lines = body.splitlines()
 
-    if not lines or not lines[0].lstrip().startswith("data="):
+    if not lines or not lines[0].lstrip().startswith(
+        "data="
+    ):
         return None, {}
 
     if len(lines) < 2:
@@ -184,7 +238,9 @@ def parse_stt(body):
 
     lines = body.splitlines()
 
-    if not lines or not lines[0].lstrip().startswith("data="):
+    if not lines or not lines[0].lstrip().startswith(
+        "data="
+    ):
         return {}, {}
 
     courses = {}
@@ -239,7 +295,6 @@ def fetch_preview(race_date, venue_code, race_no):
     )
 
     tkz_body = fetch_text(tkz_url)
-    stt_body = fetch_text(stt_url)
 
     if tkz_body is None:
         return {
@@ -260,6 +315,8 @@ def fetch_preview(race_date, venue_code, race_no):
             "courses": {},
             "start_timing": {},
         }
+
+    stt_body = fetch_text(stt_url)
 
     if stt_body is None:
         return {
