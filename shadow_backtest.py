@@ -1,1071 +1,1635 @@
 import json
 import math
+from itertools import permutations
 import os
 import sqlite3
+from datetime import datetime
+from zoneinfo import ZoneInfo
 
-DB = os.environ.get("DB_PATH", "/data/boatrace_ev.sqlite3")
+from boatcast_preview import fetch_preview
+from combined_racer_parser import parse_racelist
+from probability_model import (
+    Boat,
+    predict_probabilities,
+)
+
+
+JST = ZoneInfo("Asia/Tokyo")
+
+DB = os.environ.get(
+    "DB_PATH",
+    "/data/boatrace_ev.sqlite3",
+)
+
 MODEL_VERSION = "heuristic-v1"
 
-STAKE_PER_SELECTION = 100
-MIN_PROBABILITY = {"2T": 0.12, "3T": 0.08}
-MAX_SELECTIONS = {"2T": 5, "3T": 8}
-EV_THRESHOLDS = (0.00, 0.05, 0.10, 0.20, 0.30, 0.50, 1.00)
-DIAGNOSTIC_MIN_EV = 0.05
-CHECKPOINTS = (2, 1)
-
-REASON_PRIORITY = {
-    "DATA_MISSING": 0,
-    "OTHER": 1,
-    "LOW_PROBABILITY": 2,
-    "LOW_EV": 3,
-    "CANDIDATE": 4,
-}
+CHECKPOINTS = (
+    2,
+    1,
+)
 
 
 def connect():
-    con = sqlite3.connect(DB, timeout=30)
+    con = sqlite3.connect(
+        DB,
+        timeout=30,
+    )
+
     con.row_factory = sqlite3.Row
+
     return con
 
 
-def load_records():
+def now_jst():
+    return datetime.now(
+        JST
+    )
+
+
+def init_db():
+    with connect() as con:
+        con.execute(
+            """
+            CREATE TABLE IF NOT EXISTS shadow_prediction_records (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+
+                race_id TEXT NOT NULL,
+                race_date TEXT NOT NULL,
+                venue_code TEXT NOT NULL,
+                race_no INTEGER NOT NULL,
+                race_category TEXT NOT NULL,
+                deadline TEXT,
+
+                bet_type TEXT NOT NULL,
+
+                checkpoint_minutes INTEGER NOT NULL,
+                actual_minutes REAL NOT NULL,
+
+                odds_snapshot_id INTEGER NOT NULL,
+                odds_captured_at TEXT NOT NULL,
+
+                model_version TEXT NOT NULL,
+                model_verified INTEGER NOT NULL,
+
+                selections_json TEXT NOT NULL,
+                selection_count INTEGER NOT NULL,
+
+                status TEXT NOT NULL,
+                recorded_at TEXT NOT NULL,
+
+                UNIQUE(
+                    race_id,
+                    bet_type,
+                    checkpoint_minutes,
+                    model_version
+                )
+            )
+            """
+        )
+
+        con.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_shadow_race
+            ON shadow_prediction_records (
+                race_id,
+                bet_type,
+                checkpoint_minutes
+            )
+            """
+        )
+
+
+def init_issue_db():
+    with connect() as con:
+        con.execute(
+            """
+            CREATE TABLE IF NOT EXISTS shadow_data_issues (
+                race_id TEXT NOT NULL,
+                checkpoint_minutes INTEGER NOT NULL,
+                bet_type TEXT NOT NULL,
+                boat_number INTEGER NOT NULL,
+                missing_field TEXT NOT NULL,
+                reason TEXT NOT NULL,
+                observed_at TEXT NOT NULL,
+                observation_scope TEXT NOT NULL,
+
+                PRIMARY KEY (
+                    race_id,
+                    checkpoint_minutes,
+                    bet_type,
+                    boat_number,
+                    missing_field
+                )
+            )
+            """
+        )
+
+
+def get_checkpoint_pairs():
     with connect() as con:
         rows = con.execute(
             """
             SELECT
-                s.id, s.race_id, s.bet_type, s.checkpoint_minutes,
-                s.actual_minutes, s.model_version, s.selections_json,
-                r.winning_2t, r.winning_3t, r.payout_2t, r.payout_3t
-            FROM shadow_prediction_records AS s
-            INNER JOIN race_results AS r
-                ON r.race_id = s.race_id
-            WHERE s.status='SHADOW_RECORDED'
-              AND s.model_version=?
-            ORDER BY s.race_id, s.checkpoint_minutes, s.bet_type
-            """,
-            (MODEL_VERSION,),
+                race_id,
+                race_date,
+                venue_code,
+                race_no,
+                checkpoint_minutes,
+
+                MAX(
+                    CASE
+                        WHEN bet_type='2T'
+                        THEN snapshot_id
+                    END
+                ) AS snapshot_2t,
+
+                MAX(
+                    CASE
+                        WHEN bet_type='3T'
+                        THEN snapshot_id
+                    END
+                ) AS snapshot_3t,
+
+                MAX(
+                    CASE
+                        WHEN bet_type='2T'
+                        THEN actual_minutes
+                    END
+                ) AS minutes_2t,
+
+                MAX(
+                    CASE
+                        WHEN bet_type='3T'
+                        THEN actual_minutes
+                    END
+                ) AS minutes_3t,
+
+                MAX(
+                    CASE
+                        WHEN bet_type='2T'
+                        THEN captured_at
+                    END
+                ) AS captured_2t,
+
+                MAX(
+                    CASE
+                        WHEN bet_type='3T'
+                        THEN captured_at
+                    END
+                ) AS captured_3t
+
+            FROM odds_checkpoints
+
+            WHERE checkpoint_minutes
+                IN (1, 2)
+
+            GROUP BY
+                race_id,
+                race_date,
+                venue_code,
+                race_no,
+                checkpoint_minutes
+
+            ORDER BY
+                race_date,
+                race_no,
+                checkpoint_minutes DESC
+            """
         ).fetchall()
 
-    return list(unique_records(rows))
+    return rows
 
 
-def load_diagnostic_records():
+def already_recorded(
+    race_id,
+    bet_type,
+    checkpoint,
+):
     with connect() as con:
-        return con.execute(
+        row = con.execute(
+            """
+            SELECT 1
+            FROM shadow_prediction_records
+            WHERE race_id=?
+              AND bet_type=?
+              AND checkpoint_minutes=?
+              AND model_version=?
+            LIMIT 1
+            """,
+            (
+                race_id,
+                bet_type,
+                checkpoint,
+                MODEL_VERSION,
+            ),
+        ).fetchone()
+
+    return row is not None
+
+
+def get_race_info(
+    race_date,
+    venue_code,
+    race_no,
+):
+    with connect() as con:
+        row = con.execute(
             """
             SELECT
-                s.race_id, s.bet_type, s.checkpoint_minutes,
-                s.selections_json,
-                CASE WHEN r.race_id IS NOT NULL THEN 1 ELSE 0 END
-                    AS result_exists
-            FROM shadow_prediction_records AS s
-            LEFT JOIN race_results AS r
-                ON r.race_id = s.race_id
-            WHERE s.status='SHADOW_RECORDED'
-              AND s.model_version=?
-            ORDER BY s.race_id, s.checkpoint_minutes, s.bet_type
+                race_date,
+                venue_name,
+                category,
+                deadline,
+                raw_html,
+                fetched_at
+            FROM race_pages
+            WHERE race_date=?
+              AND venue_code=?
+              AND race_no=?
+              AND category != 'female'
+            ORDER BY fetched_at DESC
+            LIMIT 1
             """,
-            (MODEL_VERSION,),
-        ).fetchall()
+            (
+                race_date,
+                venue_code,
+                race_no,
+            ),
+        ).fetchone()
+
+    return row
 
 
-def load_checkpoint_status():
+def load_odds(
+    snapshot_id,
+    bet_type,
+):
     with connect() as con:
-        return con.execute(
+        rows = con.execute(
             """
             SELECT
-                o.race_id,
-                o.checkpoint_minutes,
-                MAX(CASE WHEN o.bet_type='2T' THEN 1 ELSE 0 END) AS has_2t,
-                MAX(CASE WHEN o.bet_type='3T' THEN 1 ELSE 0 END) AS has_3t,
-                CASE WHEN r.race_id IS NOT NULL THEN 1 ELSE 0 END
-                    AS result_exists
-            FROM odds_checkpoints AS o
-            LEFT JOIN race_results AS r
-                ON r.race_id=o.race_id
-            WHERE o.checkpoint_minutes IN (1, 2)
-            GROUP BY o.race_id, o.checkpoint_minutes
-            ORDER BY o.race_id, o.checkpoint_minutes
-            """
+                selection,
+                odds
+            FROM mapped_odds
+            WHERE snapshot_id=?
+              AND bet_type=?
+            ORDER BY selection
+            """,
+            (
+                snapshot_id,
+                bet_type,
+            ),
         ).fetchall()
 
+    return {
+        row["selection"]:
+            row["odds"]
+        for row in rows
+    }
 
-def valid_number(value):
-    if not isinstance(value, (int, float)) or isinstance(value, bool):
+
+def active_boats_from_odds(
+    odds_map,
+):
+    active = set()
+
+    for selection in odds_map:
+        for value in selection.split("-"):
+            try:
+                number = int(value)
+            except ValueError:
+                continue
+
+            if 1 <= number <= 6:
+                active.add(number)
+
+    if len(active) not in (
+        5,
+        6,
+    ):
+        return []
+
+    return sorted(active)
+
+
+def expected_count(
+    boat_count,
+    bet_type,
+):
+    if bet_type == "2T":
+        return (
+            boat_count
+            * (boat_count - 1)
+        )
+
+    if bet_type == "3T":
+        return (
+            boat_count
+            * (boat_count - 1)
+            * (boat_count - 2)
+        )
+
+    raise ValueError(
+        "Invalid bet type"
+    )
+
+
+def build_boats(
+    racelist,
+    preview,
+    active_numbers,
+):
+    exhibition = preview[
+        "exhibition"
+    ]
+
+    courses = preview[
+        "courses"
+    ]
+
+    active_numbers = sorted(
+        active_numbers
+    )
+
+    if len(active_numbers) not in (
+        5,
+        6,
+    ):
+        return []
+
+    for number in active_numbers:
+        if (
+            number not in racelist
+            or number not in exhibition
+            or number not in courses
+        ):
+            return []
+
+    course_values = [
+        courses[number]
+        for number in active_numbers
+    ]
+
+    if (
+        len(set(course_values))
+        != len(course_values)
+    ):
+        return []
+
+    boats = []
+
+    for number in active_numbers:
+        data = racelist[number]
+
+        boats.append(
+            Boat(
+                number=number,
+                racer_win_rate=data[
+                    "racer_win_rate"
+                ],
+                motor_2rate=data[
+                    "motor_2rate"
+                ],
+                exhibition_time=(
+                    exhibition[number]
+                ),
+                average_st=data[
+                    "average_st"
+                ],
+                course=courses[
+                    number
+                ],
+            )
+        )
+
+    return boats
+
+
+def build_payload(
+    boats,
+    odds_map,
+    bet_type,
+):
+    probabilities = (
+        predict_probabilities(
+            boats,
+            bet_type,
+        )
+    )
+
+    boat_count = len(
+        boats
+    )
+
+    expected = expected_count(
+        boat_count,
+        bet_type,
+    )
+
+    if len(odds_map) != expected:
+        raise ValueError(
+            "Incomplete odds map"
+        )
+
+    if len(probabilities) != expected:
+        raise ValueError(
+            "Incomplete probability map"
+        )
+
+    if (
+        set(probabilities)
+        != set(odds_map)
+    ):
+        raise ValueError(
+            "Odds/probability mismatch"
+        )
+
+    result = []
+
+    for selection in sorted(
+        probabilities
+    ):
+        probability = (
+            probabilities[
+                selection
+            ]
+        )
+
+        odds = odds_map[
+            selection
+        ]
+
+        ev = (
+            probability
+            * odds
+            - 1
+        )
+
+        result.append(
+            {
+                "selection":
+                    selection,
+                "probability":
+                    round(
+                        probability,
+                        8,
+                    ),
+                "odds":
+                    round(
+                        odds,
+                        2,
+                    ),
+                "ev":
+                    round(
+                        ev,
+                        6,
+                    ),
+            }
+        )
+
+    return result
+
+
+def parse_timestamp(value):
+    if not isinstance(
+        value,
+        str,
+    ):
+        return None
+
+    try:
+        parsed = (
+            datetime.fromisoformat(
+                value
+            )
+        )
+    except ValueError:
+        return None
+
+    if parsed.tzinfo is None:
+        return None
+
+    return parsed
+
+
+def deadline_datetime(
+    race_date,
+    value,
+):
+    parsed = parse_timestamp(
+        value
+    )
+
+    if parsed is not None:
+        return parsed
+
+    if (
+        not isinstance(
+            value,
+            str,
+        )
+        or not isinstance(
+            race_date,
+            str,
+        )
+    ):
+        return None
+
+    try:
+        return datetime.strptime(
+            f"{race_date} {value}",
+            "%Y%m%d %H:%M",
+        ).replace(
+            tzinfo=JST
+        )
+
+    except ValueError:
+        return None
+
+
+def finite_number(value):
+    if (
+        isinstance(
+            value,
+            bool,
+        )
+        or not isinstance(
+            value,
+            (int, float),
+        )
+    ):
         return False
 
     try:
-        return math.isfinite(value)
+        return math.isfinite(
+            value
+        )
+
     except OverflowError:
         return False
 
 
-def valid_selection(selection, bet_type):
-    if bet_type not in MIN_PROBABILITY or not isinstance(selection, str):
-        return False
+def as_mapping(value):
+    return (
+        value
+        if isinstance(
+            value,
+            dict,
+        )
+        else {}
+    )
+
+
+def selection_numbers(
+    selection,
+    bet_type,
+):
+    if not isinstance(
+        selection,
+        str,
+    ):
+        return ()
 
     parts = selection.split("-")
-    required = 2 if bet_type == "2T" else 3
 
-    return (
-        len(parts) == required
-        and len(set(parts)) == required
-        and all(
-            part in {"1", "2", "3", "4", "5", "6"}
+    count = (
+        2
+        if bet_type == "2T"
+        else 3
+    )
+
+    if (
+        len(parts)
+        != count
+        or len(
+            set(parts)
+        )
+        != count
+        or any(
+            part not in {
+                "1",
+                "2",
+                "3",
+                "4",
+                "5",
+                "6",
+            }
             for part in parts
         )
+    ):
+        return ()
+
+    return tuple(
+        int(part)
+        for part in parts
     )
 
 
-def valid_item(item, bet_type):
-    if not isinstance(item, dict):
-        return False
+def observed_boats(
+    odds_map,
+    bet_type,
+    racelist,
+    preview,
+):
+    """Prefer a consistent preview roster; odds must not hide a whole boat.
 
-    probability = item.get("probability")
-    odds = item.get("odds")
+    Racelist may still contain a withdrawn sixth boat, so only use it as a
+    fallback when exhibition/course rosters are incomplete or inconsistent.
+    Conflicting observed boat numbers are retained for diagnosis, not dropped.
+    """
+    numbers = set()
 
-    return (
-        valid_selection(
-            item.get("selection"),
-            bet_type,
+    for selection in odds_map:
+        numbers.update(
+            selection_numbers(
+                selection,
+                bet_type,
+            )
         )
-        and valid_number(probability)
-        and 0 < probability <= 1
-        and valid_number(odds)
-        and odds > 1
-        and valid_number(item.get("ev"))
+
+    preview = as_mapping(
+        preview
     )
 
-
-def unique_records(rows):
-    seen = set()
-
-    for row in rows:
-        key = (
-            row["race_id"],
-            row["checkpoint_minutes"],
-            row["bet_type"],
-            row["model_version"],
+    exhibition = {
+        number
+        for number in as_mapping(
+            preview.get(
+                "exhibition"
+            )
         )
-
-        if key in seen:
-            continue
-
-        seen.add(key)
-        yield row
-
-
-def empty_counts():
-    return {
-        "total": 0,
-        "invalid": 0,
-        "low_probability": 0,
-        "low_ev": 0,
-        "candidate": 0,
+        if (
+            type(number) is int
+            and 1 <= number <= 6
+        )
     }
 
-
-def diagnose_selections(
-    selections,
-    bet_type,
-    min_ev=DIAGNOSTIC_MIN_EV,
-):
-    counts = empty_counts()
-    max_probability = None
-
-    if (
-        bet_type not in MIN_PROBABILITY
-        or not isinstance(selections, list)
-    ):
-        return {
-            "reason": "OTHER",
-            "counts": counts,
-            "max_probability": None,
-        }
-
-    min_probability = MIN_PROBABILITY[bet_type]
-
-    for item in selections:
-        counts["total"] += 1
-
-        if not valid_item(item, bet_type):
-            counts["invalid"] += 1
-            continue
-
-        probability = item["probability"]
-        ev = item["ev"]
-
+    courses = {
+        number
+        for number in as_mapping(
+            preview.get(
+                "courses"
+            )
+        )
         if (
-            max_probability is None
-            or probability > max_probability
-        ):
-            max_probability = probability
+            type(number) is int
+            and 1 <= number <= 6
+        )
+    }
 
-        if probability < min_probability:
-            counts["low_probability"] += 1
-
-        elif ev < min_ev:
-            counts["low_ev"] += 1
-
-        else:
-            counts["candidate"] += 1
-
-    valid_count = (
-        counts["total"]
-        - counts["invalid"]
+    numbers.update(
+        exhibition | courses
     )
 
-    if valid_count <= 0:
-        reason = "OTHER"
+    if (
+        exhibition != courses
+        or len(exhibition)
+        not in (5, 6)
+    ):
+        numbers.update(
+            number
+            for number in as_mapping(
+                racelist
+            )
+            if (
+                type(number) is int
+                and 1 <= number <= 6
+            )
+        )
 
-    elif counts["candidate"] > 0:
-        reason = "CANDIDATE"
+    return sorted(
+        numbers
+    )
 
-    elif counts["low_ev"] > 0:
-        reason = "LOW_EV"
+
+def diagnose_inputs(
+    racelist,
+    preview,
+    odds_map,
+    bet_type,
+    snapshot_id,
+):
+    """Describe observed inputs, not the original historical failure cause.
+
+    boat=0 means a boat cannot be identified. Preview boat rosters supplement
+    the odds universe; incomplete preview falls back to the racelist.
+    """
+    issues = set()
+
+    racers = as_mapping(
+        racelist
+    )
+
+    preview = as_mapping(
+        preview
+    )
+
+    exhibition = as_mapping(
+        preview.get(
+            "exhibition"
+        )
+    )
+
+    courses = as_mapping(
+        preview.get(
+            "courses"
+        )
+    )
+
+    numbers = observed_boats(
+        odds_map,
+        bet_type,
+        racers,
+        preview,
+    )
+
+    targets = (
+        numbers
+        or [0]
+    )
+
+    def issue(
+        number,
+        field,
+        reason,
+    ):
+        issues.add(
+            (
+                number,
+                field,
+                reason,
+            )
+        )
+
+    if len(numbers) not in (
+        5,
+        6,
+    ):
+        issue(
+            0,
+            "odds",
+            "active_boats_unresolved",
+        )
+
+    for number in targets:
+        data = racers.get(
+            number
+        )
+
+        if not isinstance(
+            data,
+            dict,
+        ):
+            issue(
+                number,
+                "racelist",
+                "boat_row_missing_or_invalid",
+            )
+
+            data = {}
+
+        for field in (
+            "racer_win_rate",
+            "motor_2rate",
+            "average_st",
+        ):
+            value = data.get(
+                field
+            )
+
+            if not finite_number(
+                value
+            ):
+                issue(
+                    number,
+                    field,
+                    (
+                        "missing"
+                        if value is None
+                        else "invalid_number"
+                    ),
+                )
+
+        value = exhibition.get(
+            number
+        )
+
+        if not finite_number(
+            value
+        ):
+            issue(
+                number,
+                "exhibition_time",
+                (
+                    "missing"
+                    if value is None
+                    else "invalid_number"
+                ),
+            )
+
+        course = courses.get(
+            number
+        )
+
+        if (
+            not finite_number(
+                course
+            )
+            or course
+            not in range(
+                1,
+                7,
+            )
+        ):
+            issue(
+                number,
+                "course",
+                (
+                    "missing"
+                    if course is None
+                    else "invalid_course"
+                ),
+            )
+
+        elif (
+            sum(
+                courses.get(
+                    candidate
+                )
+                == course
+                for candidate
+                in numbers
+            )
+            > 1
+        ):
+            issue(
+                number,
+                "course",
+                "duplicate_course",
+            )
+
+    if (
+        snapshot_id is None
+        or not odds_map
+    ):
+        for number in targets:
+            issue(
+                number,
+                "odds",
+                (
+                    "snapshot_missing"
+                    if snapshot_id is None
+                    else "empty_snapshot"
+                ),
+            )
 
     else:
-        reason = "LOW_PROBABILITY"
+        for (
+            selection,
+            odds,
+        ) in odds_map.items():
 
-    return {
-        "reason": reason,
-        "counts": counts,
-        "max_probability": max_probability,
-    }
-
-
-def slot_key(
-    race_id,
-    checkpoint,
-    bet_type,
-):
-    return (
-        str(race_id),
-        int(checkpoint),
-        str(bet_type),
-    )
-
-
-def build_diagnostics(
-    diagnostic_rows,
-    checkpoint_rows,
-):
-    slots = {}
-
-    # 同じ race/checkpoint/bet は1回だけ集計
-    for row in diagnostic_rows:
-        key = slot_key(
-            row["race_id"],
-            row["checkpoint_minutes"],
-            row["bet_type"],
-        )
-
-        if key in slots:
-            continue
-
-        try:
-            selections = json.loads(
-                row["selections_json"]
+            participants = (
+                selection_numbers(
+                    selection,
+                    bet_type,
+                )
             )
 
-        except (
-            TypeError,
-            ValueError,
-            RecursionError,
-        ):
-            slots[key] = {
-                "reason": "OTHER",
-                "detail": "invalid_json",
-                "counts": {
-                    **empty_counts(),
-                    "invalid": 1,
-                },
-                "max_probability": None,
-                "result_exists": bool(
-                    row["result_exists"]
-                ),
-            }
+            if not participants:
+                issue(
+                    0,
+                    "odds",
+                    "invalid_selection",
+                )
 
-            continue
-
-        info = diagnose_selections(
-            selections,
-            row["bet_type"],
-        )
-
-        info["detail"] = "shadow_record"
-        info["result_exists"] = bool(
-            row["result_exists"]
-        )
-
-        slots[key] = info
-
-    seen_checkpoint = set()
-
-    for row in checkpoint_rows:
-        race_id = str(
-            row["race_id"]
-        )
-
-        checkpoint = int(
-            row["checkpoint_minutes"]
-        )
-
-        cp_key = (
-            race_id,
-            checkpoint,
-        )
-
-        if cp_key in seen_checkpoint:
-            continue
-
-        seen_checkpoint.add(
-            cp_key
-        )
-
-        for bet_type in (
-            "2T",
-            "3T",
-        ):
-            key = slot_key(
-                race_id,
-                checkpoint,
-                bet_type,
-            )
-
-            has_odds = bool(
-                row[
-                    "has_2t"
-                    if bet_type == "2T"
-                    else "has_3t"
-                ]
-            )
-
-            if not has_odds:
-                slots[key] = {
-                    "reason":
-                        "DATA_MISSING",
-
-                    "detail":
-                        "missing_odds_checkpoint",
-
-                    "counts":
-                        empty_counts(),
-
-                    "max_probability":
-                        None,
-
-                    "result_exists":
-                        bool(
-                            row[
-                                "result_exists"
-                            ]
-                        ),
-                }
-
-            elif key not in slots:
-                slots[key] = {
-                    "reason":
-                        "DATA_MISSING",
-
-                    "detail":
-                        "missing_shadow_record",
-
-                    "counts":
-                        empty_counts(),
-
-                    "max_probability":
-                        None,
-
-                    "result_exists":
-                        bool(
-                            row[
-                                "result_exists"
-                            ]
-                        ),
-                }
-
-    race_reasons = {}
-    pending_races = set()
-
-    # race_id は1回だけ集計
-    for (
-        race_id,
-        _checkpoint,
-        _bet_type,
-    ), info in slots.items():
-
-        if not info[
-            "result_exists"
-        ]:
-            pending_races.add(
-                race_id
-            )
-            continue
-
-        reason = info["reason"]
-
-        current = race_reasons.get(
-            race_id
-        )
-
-        if (
-            current is None
-            or REASON_PRIORITY[
-                reason
-            ]
-            < REASON_PRIORITY[
-                current
-            ]
-        ):
-            race_reasons[
-                race_id
-            ] = reason
-
-    return {
-        "slots":
-            slots,
-
-        "race_reasons":
-            race_reasons,
-
-        "pending_races":
-            pending_races,
-    }
-
-
-def candidate_score(
-    probability,
-    ev,
-):
-    return (
-        ev * 0.60
-        + probability * 0.40
-    )
-
-
-def select_candidates(
-    selections,
-    bet_type,
-    min_ev,
-):
-    if (
-        bet_type not in MIN_PROBABILITY
-        or not isinstance(
-            selections,
-            list,
-        )
-    ):
-        return []
-
-    valid = []
-
-    min_probability = (
-        MIN_PROBABILITY[
-            bet_type
-        ]
-    )
-
-    for item in selections:
-
-        if not valid_item(
-            item,
-            bet_type,
-        ):
-            continue
-
-        probability = (
-            item["probability"]
-        )
-
-        ev = item["ev"]
-
-        if (
-            probability
-            < min_probability
-            or ev < min_ev
-        ):
-            continue
-
-        valid.append(
-            (
-                item,
-                candidate_score(
-                    probability,
-                    ev,
-                ),
-            )
-        )
-
-    valid.sort(
-        key=lambda pair: (
-            -pair[1],
-            -pair[0]["ev"],
-            -pair[0][
-                "probability"
-            ],
-            pair[0][
-                "selection"
-            ],
-        )
-    )
-
-    return [
-        pair[0]
-        for pair in valid[
-            :MAX_SELECTIONS[
-                bet_type
-            ]
-        ]
-    ]
-
-
-def winner_and_payout(
-    row,
-):
-    if row["bet_type"] == "2T":
-        return (
-            row["winning_2t"],
-            row["payout_2t"],
-        )
-
-    return (
-        row["winning_3t"],
-        row["payout_3t"],
-    )
-
-
-def evaluate_group(
-    rows,
-    checkpoint,
-    bet_type,
-    min_ev,
-):
-    available = 0
-    bet_races = 0
-    selections_count = 0
-    hits = 0
-    stake = 0
-    payout_total = 0
-
-    for row in unique_records(
-        rows
-    ):
-        if (
-            row[
-                "checkpoint_minutes"
-            ]
-            != checkpoint
-            or row[
-                "bet_type"
-            ]
-            != bet_type
-        ):
-            continue
-
-        (
-            winner,
-            payout,
-        ) = winner_and_payout(
-            row
-        )
-
-        if (
-            not valid_selection(
-                winner,
-                bet_type,
-            )
-            or not valid_number(
-                payout
-            )
-            or payout < 0
-        ):
-            continue
-
-        available += 1
-
-        try:
-            selections = json.loads(
-                row[
-                    "selections_json"
-                ]
-            )
-
-        except (
-            TypeError,
-            ValueError,
-            RecursionError,
-        ):
-            continue
-
-        selected = (
-            select_candidates(
-                selections,
-                bet_type,
-                min_ev,
-            )
-        )
-
-        if not selected:
-            continue
-
-        bet_races += 1
-        race_hit = False
-
-        for item in selected:
-            selections_count += 1
-
-            stake += (
-                STAKE_PER_SELECTION
-            )
-
-            if (
-                item[
-                    "selection"
-                ]
-                == winner
+            elif (
+                not finite_number(
+                    odds
+                )
+                or odds < 1
             ):
-                race_hit = True
+                for number in participants:
+                    issue(
+                        number,
+                        "odds",
+                        "invalid_number",
+                    )
 
-                payout_total += int(
-                    round(
-                        STAKE_PER_SELECTION
-                        / 100
-                        * payout
+        if len(numbers) in (
+            5,
+            6,
+        ):
+            odds_boats = set()
+
+            for selection in odds_map:
+                odds_boats.update(
+                    selection_numbers(
+                        selection,
+                        bet_type,
                     )
                 )
 
-        if race_hit:
-            hits += 1
+            missing_whole = (
+                set(numbers)
+                - odds_boats
+            )
 
-    profit = (
-        payout_total
-        - stake
-    )
-
-    return {
-        "checkpoint":
-            checkpoint,
-
-        "bet_type":
-            bet_type,
-
-        "min_ev":
-            min_ev,
-
-        "min_probability":
-            MIN_PROBABILITY[
-                bet_type
-            ],
-
-        "available_races":
-            available,
-
-        "races_with_bets":
-            bet_races,
-
-        "selections":
-            selections_count,
-
-        "hit_races":
-            hits,
-
-        "stake":
-            stake,
-
-        "payout":
-            payout_total,
-
-        "profit":
-            profit,
-
-        "roi":
-            (
-                payout_total
-                / stake
-                if stake
-                else None
-            ),
-
-        "hit_rate":
-            (
-                hits
-                / bet_races
-                if bet_races
-                else None
-            ),
-
-        "coverage":
-            (
-                bet_races
-                / available
-                if available
-                else None
-            ),
-    }
-
-
-def format_percent(
-    value,
-):
-    if value is None:
-        return "N/A"
-
-    return (
-        f"{value * 100:.1f}%"
-    )
-
-
-def print_diagnostics(
-    diagnostics,
-):
-    slots = diagnostics[
-        "slots"
-    ]
-
-    print(
-        "DIAG_START",
-        f"minEV={format_percent(DIAGNOSTIC_MIN_EV)}",
-        f"minProb2T={format_percent(MIN_PROBABILITY['2T'])}",
-        f"minProb3T={format_percent(MIN_PROBABILITY['3T'])}",
-        flush=True,
-    )
-
-    for checkpoint in CHECKPOINTS:
-
-        for bet_type in (
-            "2T",
-            "3T",
-        ):
-            selected = [
-                info
-                for key, info
-                in slots.items()
-                if (
-                    key[1]
-                    == checkpoint
-                    and key[2]
-                    == bet_type
-                    and info[
-                        "result_exists"
-                    ]
+            for number in missing_whole:
+                issue(
+                    number,
+                    "odds",
+                    "boat_missing_from_odds",
                 )
-            ]
 
-            reasons = {
-                reason: 0
-                for reason
-                in REASON_PRIORITY
-            }
+            count = (
+                2
+                if bet_type == "2T"
+                else 3
+            )
 
-            selections = {
-                "invalid": 0,
-                "low_probability": 0,
-                "low_ev": 0,
-                "candidate": 0,
-            }
-
-            max_probability = None
-
-            for info in selected:
-
-                reasons[
-                    info["reason"]
-                ] += 1
-
-                for name in selections:
-                    selections[
-                        name
-                    ] += info[
-                        "counts"
-                    ][name]
-
-                value = info[
-                    "max_probability"
-                ]
+            for combination in permutations(
+                numbers,
+                count,
+            ):
+                key = "-".join(
+                    map(
+                        str,
+                        combination,
+                    )
+                )
 
                 if (
-                    value is not None
-                    and (
-                        max_probability
-                        is None
-                        or value
-                        > max_probability
+                    key not in odds_map
+                    and not (
+                        missing_whole
+                        .intersection(
+                            combination
+                        )
                     )
                 ):
-                    max_probability = (
-                        value
+                    issue(
+                        0,
+                        "odds",
+                        "selection_missing",
                     )
 
-            print(
-                "DIAG_SLOT_SUMMARY",
-                f"checkpoint={checkpoint}",
-                f"bet={bet_type}",
-                f"slots={len(selected)}",
-                f"data_missing={reasons['DATA_MISSING']}",
-                f"low_probability={reasons['LOW_PROBABILITY']}",
-                f"low_ev={reasons['LOW_EV']}",
-                f"other={reasons['OTHER']}",
-                f"candidate={reasons['CANDIDATE']}",
-                f"selection_low_probability={selections['low_probability']}",
-                f"selection_low_ev={selections['low_ev']}",
-                f"selection_invalid={selections['invalid']}",
-                f"max_probability={format_percent(max_probability)}",
-                flush=True,
-            )
-
-    reason_to_races = {
-        reason: []
-        for reason
-        in REASON_PRIORITY
-    }
-
-    for (
-        race_id,
-        reason,
-    ) in sorted(
-        diagnostics[
-            "race_reasons"
-        ].items()
-    ):
-        reason_to_races[
-            reason
-        ].append(
-            race_id
-        )
-
-    print(
-        "DIAG_RACE_SUMMARY",
-        f"unique_completed_races={len(diagnostics['race_reasons'])}",
-        f"pending_races={len(diagnostics['pending_races'])}",
-        f"data_missing={len(reason_to_races['DATA_MISSING'])}",
-        f"low_probability={len(reason_to_races['LOW_PROBABILITY'])}",
-        f"low_ev={len(reason_to_races['LOW_EV'])}",
-        f"other={len(reason_to_races['OTHER'])}",
-        f"candidate={len(reason_to_races['CANDIDATE'])}",
-        flush=True,
-    )
-
-    for reason in (
-        "DATA_MISSING",
-        "LOW_PROBABILITY",
-        "LOW_EV",
-        "OTHER",
-        "CANDIDATE",
-    ):
-        races = (
-            reason_to_races[
-                reason
-            ]
-        )
-
-        if races:
-            print(
-                "DIAG_RACES",
-                f"reason={reason}",
-                f"count={len(races)}",
-                "races="
-                + ",".join(
-                    races
-                ),
-                flush=True,
-            )
-
-    missing_details = {}
-
-    for (
-        race_id,
-        _checkpoint,
-        _bet_type,
-    ), info in slots.items():
-
-        if (
-            info[
-                "reason"
-            ]
-            == "DATA_MISSING"
-            and info[
-                "result_exists"
-            ]
-        ):
-            missing_details.setdefault(
-                info["detail"],
-                set(),
-            ).add(
-                race_id
-            )
-
-    for (
-        detail,
-        races,
-    ) in sorted(
-        missing_details.items()
-    ):
-        print(
-            "DIAG_DATA_MISSING",
-            f"detail={detail}",
-            f"count={len(races)}",
-            "races="
-            + ",".join(
-                sorted(races)
-            ),
-            flush=True,
-        )
-
-    print(
-        "DIAG_DONE",
-        flush=True,
+    return sorted(
+        issues
     )
 
 
-def print_backtest(
-    result,
+def prediction_time_valid(
+    race_info,
+    captured_at,
+    actual_minutes,
 ):
-    print(
-        "BACKTEST",
-        f"checkpoint={result['checkpoint']}",
-        f"bet={result['bet_type']}",
-        f"minProb={format_percent(result['min_probability'])}",
-        f"minEV={format_percent(result['min_ev'])}",
-        f"available={result['available_races']}",
-        f"bet_races={result['races_with_bets']}",
-        f"selections={result['selections']}",
-        f"hits={result['hit_races']}",
-        f"stake={result['stake']}",
-        f"payout={result['payout']}",
-        f"profit={result['profit']}",
-        f"ROI={format_percent(result['roi'])}",
-        f"hit_rate={format_percent(result['hit_rate'])}",
-        f"coverage={format_percent(result['coverage'])}",
-        flush=True,
-    )
+    if race_info is None:
+        return False
 
-
-def run():
-    rows = load_records()
-
-    diagnostics = (
-        build_diagnostics(
-            load_diagnostic_records(),
-            load_checkpoint_status(),
+    deadline = (
+        deadline_datetime(
+            race_info[
+                "race_date"
+            ],
+            race_info[
+                "deadline"
+            ],
         )
     )
 
-    print_diagnostics(
-        diagnostics
+    captured = parse_timestamp(
+        captured_at
     )
 
-    race_ids = {
-        row["race_id"]
-        for row in rows
-    }
-
-    print(
-        "SHADOW_BACKTEST_START",
-        f"records={len(rows)}",
-        f"races={len(race_ids)}",
-        f"model={MODEL_VERSION}",
-        flush=True,
+    fetched = parse_timestamp(
+        race_info[
+            "fetched_at"
+        ]
     )
 
-    if not rows:
-        print(
-            "SHADOW_BACKTEST_NO_DATA",
-            flush=True,
+    now = now_jst()
+
+    return (
+        deadline is not None
+        and captured is not None
+        and fetched is not None
+        and finite_number(
+            actual_minutes
         )
-        return
+        and actual_minutes > 0
+        and captured <= now
+        and fetched <= now
+        and captured < deadline
+        and fetched < deadline
+        and now < deadline
+    )
 
-    results = []
 
-    for checkpoint in CHECKPOINTS:
+def record_issues(
+    row,
+    bet_type,
+    issues,
+    observation_scope,
+):
+    observed_at = (
+        now_jst()
+        .isoformat()
+    )
 
-        for bet_type in (
-            "2T",
-            "3T",
-        ):
+    inserted = []
 
-            for min_ev in (
-                EV_THRESHOLDS
-            ):
-                result = (
-                    evaluate_group(
-                        rows,
-                        checkpoint,
-                        bet_type,
-                        min_ev,
+    with connect() as con:
+        for (
+            number,
+            field,
+            reason,
+        ) in issues:
+
+            cur = con.execute(
+                """
+                INSERT OR IGNORE INTO shadow_data_issues (
+                    race_id,
+                    checkpoint_minutes,
+                    bet_type,
+                    boat_number,
+                    missing_field,
+                    reason,
+                    observed_at,
+                    observation_scope
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    row[
+                        "race_id"
+                    ],
+                    row[
+                        "checkpoint_minutes"
+                    ],
+                    bet_type,
+                    number,
+                    field,
+                    reason,
+                    observed_at,
+                    observation_scope,
+                ),
+            )
+
+            if cur.rowcount:
+                inserted.append(
+                    (
+                        number,
+                        field,
+                        reason,
                     )
                 )
 
-                results.append(
-                    result
-                )
+    for (
+        number,
+        field,
+        reason,
+    ) in inserted:
 
-                print_backtest(
-                    result
-                )
-
-    ranked = [
-        result
-        for result in results
-        if (
-            result[
-                "roi"
-            ]
-            is not None
-            and result[
-                "races_with_bets"
-            ] > 0
+        print(
+            "DATA_ISSUE",
+            f"race={row['race_id']}",
+            f"checkpoint={row['checkpoint_minutes']}",
+            f"bet={bet_type}",
+            f"boat={number}",
+            f"missing={field}",
+            f"reason={reason}",
+            f"observed_at={observed_at}",
+            f"scope={observation_scope}",
+            flush=True,
         )
+
+
+def save_shadow(
+    *,
+    race_id,
+    race_date,
+    venue_code,
+    race_no,
+    race_category,
+    deadline,
+    bet_type,
+    checkpoint,
+    actual_minutes,
+    snapshot_id,
+    odds_captured_at,
+    selections,
+):
+    payload = json.dumps(
+        selections,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(
+            ",",
+            ":",
+        ),
+    )
+
+    with connect() as con:
+        con.execute(
+            "BEGIN IMMEDIATE"
+        )
+
+        parsed_deadline = (
+            deadline_datetime(
+                race_date,
+                deadline,
+            )
+        )
+
+        if (
+            parsed_deadline
+            is None
+            or now_jst()
+            >= parsed_deadline
+        ):
+            return False
+
+        con.execute(
+            """
+            INSERT OR IGNORE INTO shadow_prediction_records (
+                race_id,
+                race_date,
+                venue_code,
+                race_no,
+                race_category,
+                deadline,
+                bet_type,
+                checkpoint_minutes,
+                actual_minutes,
+                odds_snapshot_id,
+                odds_captured_at,
+                model_version,
+                model_verified,
+                selections_json,
+                selection_count,
+                status,
+                recorded_at
+            )
+            VALUES (
+                ?, ?, ?, ?, ?, ?,
+                ?, ?, ?, ?, ?,
+                ?, 0, ?, ?,
+                'SHADOW_RECORDED',
+                ?
+            )
+            """,
+            (
+                race_id,
+                race_date,
+                venue_code,
+                race_no,
+                race_category,
+                deadline,
+                bet_type,
+                checkpoint,
+                actual_minutes,
+                snapshot_id,
+                odds_captured_at,
+                MODEL_VERSION,
+                payload,
+                len(selections),
+                now_jst().isoformat(),
+            ),
+        )
+
+    return True
+
+
+def record_one(
+    *,
+    row,
+    race_info,
+    racelist,
+    preview,
+    bet_type,
+    snapshot_id,
+    actual_minutes,
+    captured_at,
+):
+    race_id = row[
+        "race_id"
     ]
 
-    ranked.sort(
-        key=lambda item: (
-            -item[
-                "roi"
-            ],
-            -item[
-                "races_with_bets"
-            ],
+    checkpoint = row[
+        "checkpoint_minutes"
+    ]
+
+    if already_recorded(
+        race_id,
+        bet_type,
+        checkpoint,
+    ):
+        return (
+            "EXISTS",
+            0,
+        )
+
+    odds_map = (
+        load_odds(
+            snapshot_id,
+            bet_type,
+        )
+        if snapshot_id
+        is not None
+        else {}
+    )
+
+    issues = diagnose_inputs(
+        racelist,
+        preview,
+        odds_map,
+        bet_type,
+        snapshot_id,
+    )
+
+    eligible_time = (
+        race_info is not None
+        and prediction_time_valid(
+            race_info,
+            captured_at,
+            actual_minutes,
         )
     )
 
+    scope = (
+        "pre_deadline_observation"
+        if eligible_time
+        else
+        "diagnosis_only_current_observation"
+    )
+
+    record_issues(
+        row,
+        bet_type,
+        issues,
+        scope,
+    )
+
+    if not eligible_time:
+        return (
+            "SKIP_DIAGNOSTIC_ONLY_TIME",
+            0,
+        )
+
+    if issues:
+        return (
+            "SKIP_INCOMPLETE_DATA",
+            0,
+        )
+
+    if (
+        as_mapping(
+            preview
+        ).get(
+            "status"
+        )
+        != "READY"
+    ):
+        return (
+            "SKIP_PREVIEW_NOT_READY",
+            0,
+        )
+
+    active_numbers = (
+        active_boats_from_odds(
+            odds_map
+        )
+    )
+
+    boats = build_boats(
+        racelist,
+        preview,
+        active_numbers,
+    )
+
+    if (
+        len(boats)
+        != len(active_numbers)
+        or len(boats)
+        not in (
+            5,
+            6,
+        )
+    ):
+        return (
+            "SKIP_INCOMPLETE_DATA",
+            0,
+        )
+
+    try:
+        selections = (
+            build_payload(
+                boats,
+                odds_map,
+                bet_type,
+            )
+        )
+
+    except (
+        ValueError,
+        TypeError,
+        OverflowError,
+    ):
+        return (
+            "SKIP_ODDS_MISMATCH",
+            0,
+        )
+
+    if not prediction_time_valid(
+        race_info,
+        captured_at,
+        actual_minutes,
+    ):
+        return (
+            "SKIP_DIAGNOSTIC_ONLY_TIME",
+            0,
+        )
+
+    saved = save_shadow(
+        race_id=race_id,
+        race_date=row[
+            "race_date"
+        ],
+        venue_code=row[
+            "venue_code"
+        ],
+        race_no=row[
+            "race_no"
+        ],
+        race_category=(
+            race_info[
+                "category"
+            ]
+        ),
+        deadline=(
+            race_info[
+                "deadline"
+            ]
+        ),
+        bet_type=bet_type,
+        checkpoint=checkpoint,
+        actual_minutes=(
+            actual_minutes
+        ),
+        snapshot_id=(
+            snapshot_id
+        ),
+        odds_captured_at=(
+            captured_at
+        ),
+        selections=(
+            selections
+        ),
+    )
+
+    if saved:
+        return (
+            "SAVED",
+            len(selections),
+        )
+
+    return (
+        "SKIP_DIAGNOSTIC_ONLY_TIME",
+        0,
+    )
+
+
+def record_ready_predictions():
+    init_db()
+    init_issue_db()
+
+    saved = 0
+    skipped = 0
+    errors = 0
+
+    for row in get_checkpoint_pairs():
+
+        try:
+            race_id = row[
+                "race_id"
+            ]
+
+            checkpoint = row[
+                "checkpoint_minutes"
+            ]
+
+            if checkpoint not in CHECKPOINTS:
+                continue
+
+            configs = [
+                (
+                    bet_type,
+                    row[
+                        f"snapshot_{suffix}"
+                    ],
+                    row[
+                        f"minutes_{suffix}"
+                    ],
+                    row[
+                        f"captured_{suffix}"
+                    ],
+                )
+                for (
+                    bet_type,
+                    suffix,
+                ) in (
+                    (
+                        "2T",
+                        "2t",
+                    ),
+                    (
+                        "3T",
+                        "3t",
+                    ),
+                )
+                if not already_recorded(
+                    race_id,
+                    bet_type,
+                    checkpoint,
+                )
+            ]
+
+            if not configs:
+                continue
+
+            race_info = (
+                get_race_info(
+                    row[
+                        "race_date"
+                    ],
+                    row[
+                        "venue_code"
+                    ],
+                    row[
+                        "race_no"
+                    ],
+                )
+            )
+
+            racelist = {}
+
+            if race_info is not None:
+                try:
+                    racelist = (
+                        parse_racelist(
+                            race_info[
+                                "raw_html"
+                            ]
+                        )
+                    )
+
+                except (
+                    ValueError,
+                    TypeError,
+                    KeyError,
+                    OverflowError,
+                ):
+                    pass
+
+            try:
+                preview = (
+                    fetch_preview(
+                        row[
+                            "race_date"
+                        ],
+                        row[
+                            "venue_code"
+                        ],
+                        row[
+                            "race_no"
+                        ],
+                    )
+                )
+
+            except Exception as error:
+                preview = {}
+
+                print(
+                    "SHADOW_PREVIEW_ERROR",
+                    race_id,
+                    type(error).__name__,
+                    flush=True,
+                )
+
+            results = []
+
+            for (
+                bet_type,
+                snapshot_id,
+                actual_minutes,
+                captured_at,
+            ) in configs:
+
+                try:
+                    (
+                        status,
+                        count,
+                    ) = record_one(
+                        row=row,
+                        race_info=(
+                            race_info
+                        ),
+                        racelist=(
+                            racelist
+                        ),
+                        preview=(
+                            preview
+                        ),
+                        bet_type=(
+                            bet_type
+                        ),
+                        snapshot_id=(
+                            snapshot_id
+                        ),
+                        actual_minutes=(
+                            actual_minutes
+                        ),
+                        captured_at=(
+                            captured_at
+                        ),
+                    )
+
+                    results.append(
+                        (
+                            bet_type,
+                            status,
+                            count,
+                        )
+                    )
+
+                    if status == "SAVED":
+                        saved += 1
+
+                    elif status.startswith(
+                        "SKIP"
+                    ):
+                        skipped += 1
+
+                except Exception as error:
+                    errors += 1
+
+                    print(
+                        "SHADOW_BET_ERROR",
+                        race_id,
+                        bet_type,
+                        "checkpoint=",
+                        checkpoint,
+                        type(error).__name__,
+                        str(error)[:160],
+                        flush=True,
+                    )
+
+            if results:
+                print(
+                    "SHADOW_RESULT",
+                    race_id,
+                    "checkpoint=",
+                    checkpoint,
+                    "details=",
+                    results,
+                    "verified=",
+                    False,
+                    flush=True,
+                )
+
+        except Exception as error:
+            errors += 1
+
+            print(
+                "SHADOW_ERROR",
+                type(error).__name__,
+                str(error)[:160],
+                flush=True,
+            )
+
     print(
-        "BACKTEST_TOP",
+        "SHADOW_DONE",
+        "saved=",
+        saved,
+        "skipped=",
+        skipped,
+        "errors=",
+        errors,
+        "verified=",
+        False,
         flush=True,
     )
 
-    for result in ranked[
-        :10
-    ]:
-        print(
-            "TOP",
-            f"checkpoint={result['checkpoint']}",
-            f"bet={result['bet_type']}",
-            f"minProb={format_percent(result['min_probability'])}",
-            f"minEV={format_percent(result['min_ev'])}",
-            f"races={result['races_with_bets']}",
-            f"ROI={format_percent(result['roi'])}",
-            f"hit_rate={format_percent(result['hit_rate'])}",
-            f"coverage={format_percent(result['coverage'])}",
-            f"profit={result['profit']}",
-            flush=True,
-        )
-
-    if len(race_ids) < 30:
-        print(
-            "BACKTEST_WARNING",
-            "sample_size_too_small",
-            f"races={len(race_ids)}",
-            "need_at_least=30",
-            flush=True,
-        )
-
-    print(
-        "SHADOW_BACKTEST_DONE",
-        f"races={len(race_ids)}",
-        flush=True,
-    )
+    return {
+        "saved":
+            saved,
+        "skipped":
+            skipped,
+        "errors":
+            errors,
+    }
 
 
 if __name__ == "__main__":
-    run()
+    record_ready_predictions()
