@@ -1,5 +1,6 @@
 import json
 import math
+import re
 from itertools import permutations
 import os
 import sqlite3
@@ -115,17 +116,75 @@ def init_db():
                     UNIQUE (race_id, checkpoint, bet_type, boat_number, missing_field)
                 )
             """)
-            required = {"race_id", "checkpoint", "bet_type", "boat_number",
-                        "missing_field", "reason", "observed_at", "observation_scope"}
-            columns = {row[1] for row in con.execute("PRAGMA table_info(shadow_data_issues)")}
-            if not required.issubset(columns):
-                raise sqlite3.DatabaseError("incompatible shadow_data_issues schema")
-            con.execute("""CREATE UNIQUE INDEX IF NOT EXISTS idx_shadow_data_issue_key
-                ON shadow_data_issues (race_id, checkpoint, bet_type,
-                                       boat_number, missing_field)""")
+            issue_checkpoint_column(con)
     except sqlite3.Error as error:
         print("DATA_ISSUE_STORAGE_ERROR", "stage=init", type(error).__name__,
               str(error)[:160], flush=True)
+
+
+def issue_checkpoint_column(con):
+    """Recognize only the two known diagnostic schemas without migrating data.
+
+    Returned identifiers come from this fixed allowlist, never from raw SQL
+    supplied by a database row. Unknown constraints fail diagnostic storage
+    only; the caller keeps normal prediction handling independent.
+    """
+    table = con.execute("SELECT type, sql FROM sqlite_master WHERE name=?",
+                        ("shadow_data_issues",)).fetchone()
+    if table is None or table[0] != "table":
+        raise sqlite3.DatabaseError("unsupported diagnostic table")
+    ddl = (table[1] or "").upper()
+    if re.search(r"\b(?:CHECK|REFERENCES|COLLATE|DEFAULT|GENERATED|STRICT)\b"
+                 r"|\bWITHOUT\s+ROWID\b|\bON\s+CONFLICT\b", ddl):
+        raise sqlite3.DatabaseError("unsupported diagnostic constraints")
+    info = {row[1]: row for row in con.execute(
+        "SELECT * FROM pragma_table_xinfo(?)", ("shadow_data_issues",))}
+    choices = [name for name in ("checkpoint", "checkpoint_minutes") if name in info]
+    if len(choices) != 1:
+        raise sqlite3.DatabaseError("ambiguous diagnostic checkpoint column")
+    checkpoint_column = choices[0]
+    fields = {"race_id", checkpoint_column, "bet_type", "boat_number",
+              "missing_field", "reason", "observed_at", "observation_scope"}
+    old_schema = checkpoint_column == "checkpoint_minutes"
+    expected = fields if old_schema else fields | {"id"}
+    if set(info) != expected:
+        raise sqlite3.DatabaseError("incompatible diagnostic columns")
+    for name in fields:
+        row = info[name]
+        kind = "INTEGER" if name in (checkpoint_column, "boat_number") else "TEXT"
+        if row[2].upper() != kind or not row[3] or row[4] is not None or row[6]:
+            raise sqlite3.DatabaseError("incompatible diagnostic column definition")
+    key = ("race_id", checkpoint_column, "bet_type", "boat_number", "missing_field")
+    primary = tuple(row[1] for row in sorted(info.values(), key=lambda row: row[5])
+                    if row[5])
+    if old_schema:
+        if primary != key:
+            raise sqlite3.DatabaseError("incompatible diagnostic primary key")
+    else:
+        identity = info["id"]
+        if (primary != ("id",) or identity[2].upper() != "INTEGER"
+                or identity[4] is not None or identity[6]):
+            raise sqlite3.DatabaseError("incompatible diagnostic identity")
+    if con.execute("SELECT 1 FROM sqlite_master WHERE type='trigger' AND tbl_name=?",
+                   ("shadow_data_issues",)).fetchone():
+        raise sqlite3.DatabaseError("unsupported diagnostic trigger")
+    has_unique_key = False
+    for index in con.execute("SELECT * FROM pragma_index_list(?)",
+                             ("shadow_data_issues",)).fetchall():
+        details = con.execute("SELECT * FROM pragma_index_xinfo(?)",
+                              (index[1],)).fetchall()
+        indexed = tuple(row[2] for row in details if row[5])
+        standard = all(row[2] in fields and row[3] == 0 and row[4] == "BINARY"
+                       for row in details if row[5])
+        if index[2]:
+            if index[4] or indexed != key or not standard:
+                raise sqlite3.DatabaseError("unsupported diagnostic unique index")
+            has_unique_key = True
+        elif index[1] == "idx_shadow_data_issue_key":
+            raise sqlite3.DatabaseError("incompatible named diagnostic index")
+    if not has_unique_key:
+        raise sqlite3.DatabaseError("missing diagnostic unique key")
+    return checkpoint_column
 
 
 def get_checkpoint_pairs():
@@ -446,23 +505,24 @@ def save_data_issues(race_id, checkpoint, bet_type, issues, observation_scope):
     inserted = []
     with connect() as con:
         con.execute("BEGIN IMMEDIATE")
+        checkpoint_column = issue_checkpoint_column(con)
         for number, field, reason in issues:
-            # Also deduplicate an older compatible table without its index.
-            exists = con.execute("""SELECT 1 FROM shadow_data_issues
-                WHERE race_id=? AND checkpoint=? AND bet_type=?
+            exists = con.execute(f"""SELECT 1 FROM shadow_data_issues
+                WHERE race_id=? AND {checkpoint_column}=? AND bet_type=?
                   AND boat_number=? AND missing_field=? LIMIT 1""",
                 (race_id, checkpoint, bet_type, number, field)).fetchone()
             if exists:
                 continue
-            cursor = con.execute("""
-                INSERT OR IGNORE INTO shadow_data_issues
-                    (race_id, checkpoint, bet_type, boat_number, missing_field,
+            cursor = con.execute(f"""
+                INSERT INTO shadow_data_issues
+                    (race_id, {checkpoint_column}, bet_type, boat_number, missing_field,
                      reason, observed_at, observation_scope)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             """, (race_id, checkpoint, bet_type, number, field, reason,
                   observed_at, observation_scope))
-            if cursor.rowcount:
-                inserted.append((number, field, reason))
+            if cursor.rowcount != 1:
+                raise sqlite3.DatabaseError("diagnostic row was not inserted")
+            inserted.append((number, field, reason))
     for number, field, reason in inserted:
         print("DATA_ISSUE", f"race_id={race_id}", f"checkpoint={checkpoint}",
               f"bet_type={bet_type}", f"boat_number={number}",
