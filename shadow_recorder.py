@@ -8,7 +8,7 @@ from datetime import datetime
 from zoneinfo import ZoneInfo
 
 from boatcast_preview import fetch_preview
-from combined_racer_parser import parse_racelist
+from combined_racer_parser import parse_racelist_diagnostic as parse_racelist
 from probability_model import (
     Boat,
     predict_probabilities,
