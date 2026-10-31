@@ -31,7 +31,8 @@ def build_url(kind, race_date, venue_code, race_no):
     return f"{BASE}/hp_txt/{venue_code}/{filename}"
 
 
-def fetch_text(url):
+def fetch_text_result(url):
+    failure = "FETCH_FAILED"
     headers = {
         "User-Agent": "boatrace-ev/1.0",
         "Accept": "text/plain,*/*",
@@ -70,7 +71,7 @@ def fetch_text(url):
                     "url=", url,
                     flush=True,
                 )
-                return None
+                return None, "INVALID_CONTENT"
 
             if not body.strip():
                 print(
@@ -78,7 +79,7 @@ def fetch_text(url):
                     "url=", url,
                     flush=True,
                 )
-                return None
+                return None, "EMPTY_BODY"
 
             print(
                 "FETCH_OK",
@@ -86,7 +87,7 @@ def fetch_text(url):
                 "url=", url,
                 flush=True,
             )
-            return body
+            return body, "OK"
 
         except urllib.error.HTTPError as error:
             code = error.code
@@ -107,7 +108,7 @@ def fetch_text(url):
                     "url=", url,
                     flush=True,
                 )
-                return None
+                return None, "ACCESS_DENIED"
 
             if code == 404:
                 print(
@@ -115,13 +116,14 @@ def fetch_text(url):
                     "url=", url,
                     flush=True,
                 )
-                return None
+                return None, "NOT_FOUND"
 
             if code not in (
                 408, 429, 500, 502, 503, 504
             ):
-                return None
+                return None, "HTTP_ERROR"
 
+            failure = "RATE_LIMITED" if code == 429 else "HTTP_ERROR"
             if code == 429:
                 retry_after = error.headers.get(
                     "Retry-After", ""
@@ -136,6 +138,7 @@ def fetch_text(url):
             urllib.error.URLError,
             TimeoutError,
         ) as error:
+            failure = "CONNECTION_ERROR"
             print(
                 "FETCH_CONNECTION_ERROR",
                 "attempt=", attempt,
@@ -148,7 +151,65 @@ def fetch_text(url):
             time.sleep(attempt * 2)
 
     print("FETCH_FAILED", url, flush=True)
-    return None
+    return None, failure
+
+
+def fetch_text(url):
+    """Preserve the existing body-or-None interface for other callers."""
+    return fetch_text_result(url)[0]
+
+
+def preview_format_valid(body):
+    if not isinstance(body, str):
+        return False
+    lines = body.splitlines()
+    return len(lines) >= 2 and lines[0].lstrip().startswith("data=")
+
+
+def empty_values_reason(body, kind):
+    """Classify zero extracted values; placeholders do not prove publication state.
+
+    Mirror only the rows/columns consumed by the existing parser. Never provide
+    replacement values or interpret the tkz trailing timing section as courses.
+    """
+    if not preview_format_valid(body):
+        return "PARSE_INVALID"
+    rows = [line for line in body.splitlines()[2:] if line.strip()]
+    if kind == "tkz":
+        rows = rows[:6]
+    if not rows:
+        return "EMPTY_DATA"
+    placeholders = ("", "-", "－")
+    for row in rows:
+        columns = row.split("\t")
+        if kind == "tkz":
+            if len(columns) < 2:
+                return "PARSE_INVALID"
+            value = columns[1].strip()
+            if value not in placeholders:
+                number = to_float(value)
+                if number is None or not 5.0 <= number <= 10.0:
+                    return "PARSE_INVALID"
+                # Caller has no extracted values; a valid value is inconsistent.
+                return "PARSE_INVALID"
+        elif kind == "stt":
+            if len(columns) < 5:
+                return "PARSE_INVALID"
+            for value in columns[:2]:
+                value = value.strip()
+                if value in placeholders:
+                    continue
+                try:
+                    number = int(value)
+                except ValueError:
+                    return "PARSE_INVALID"
+                if not 1 <= number <= 6:
+                    return "PARSE_INVALID"
+            if all(value.strip() not in placeholders for value in columns[:2]):
+                return "PARSE_INVALID"
+        else:
+            return "PARSE_INVALID"
+    return "VALUES_NOT_READY"
 
 
 def to_float(value):
@@ -294,18 +355,25 @@ def fetch_preview(race_date, venue_code, race_no):
         race_no,
     )
 
-    tkz_body = fetch_text(tkz_url)
+    tkz_body, tkz_failure = fetch_text_result(tkz_url)
 
     if tkz_body is None:
         return {
             "status": "SKIP",
-            "reason": "TKZ_NOT_FOUND",
+            "reason": "TKZ_" + tkz_failure,
             "exhibition": {},
             "courses": {},
             "start_timing": {},
         }
 
+    if not preview_format_valid(tkz_body):
+        return {"status": "SKIP", "reason": "TKZ_PARSE_INVALID",
+                "exhibition": {}, "courses": {}, "start_timing": {}}
     tkz_status, exhibition = parse_tkz(tkz_body)
+    print("PREVIEW_DATA_STATUS", "kind=tkz", "status=", tkz_status,
+          "exhibition_count=", len(exhibition),
+          "exhibition_state=", "VALUES_PRESENT" if exhibition else empty_values_reason(tkz_body, "tkz"),
+          "url=", tkz_url, flush=True)
 
     if tkz_status != "1":
         return {
@@ -316,25 +384,33 @@ def fetch_preview(race_date, venue_code, race_no):
             "start_timing": {},
         }
 
-    stt_body = fetch_text(stt_url)
+    stt_body, stt_failure = fetch_text_result(stt_url)
 
     if stt_body is None:
         return {
             "status": "SKIP",
-            "reason": "STT_NOT_FOUND",
+            "reason": "STT_" + stt_failure,
             "exhibition": exhibition,
             "courses": {},
             "start_timing": {},
         }
 
+    if not preview_format_valid(stt_body):
+        return {"status": "SKIP", "reason": "STT_PARSE_INVALID",
+                "exhibition": exhibition, "courses": {}, "start_timing": {}}
     courses, start_timing = parse_stt(stt_body)
+    print("PREVIEW_DATA_STATUS", "kind=stt", "course_count=", len(courses),
+          "url=", stt_url, flush=True)
 
     common = set(exhibition) & set(courses)
 
     if len(common) not in (5, 6):
         return {
             "status": "SKIP",
-            "reason": "INCOMPLETE_PREVIEW",
+            "reason": ("TKZ_" + empty_values_reason(tkz_body, "tkz")
+                       if not exhibition else
+                       "STT_" + empty_values_reason(stt_body, "stt")
+                       if not courses else "INCOMPLETE_PREVIEW"),
             "exhibition": exhibition,
             "courses": courses,
             "start_timing": start_timing,
