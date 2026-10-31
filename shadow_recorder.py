@@ -884,6 +884,17 @@ def record_ready_predictions():
                 racelist = parse_racelist(race_info["raw_html"]) if race_info else {}
             except (ValueError, TypeError, KeyError, AttributeError):
                 racelist = {}
+            # Do not spend HTTP time on rows that cannot make a new prediction.
+            # Post-deadline/unknown-deadline diagnostics are intentionally omitted;
+            # pre-deadline diagnostic handling and all later save guards remain.
+            deadline = race_info["deadline"] if race_info is not None else None
+            if not before_deadline(row["race_date"], deadline):
+                skipped += sum(not already_recorded(race_id, bet, checkpoint)
+                               for bet in ("2T", "3T"))
+                print("SHADOW_PREVIEW_SKIPPED", race_id, "checkpoint=", checkpoint,
+                      "reason=DEADLINE_PASSED_OR_UNKNOWN", "verified=", False,
+                      flush=True)
+                continue
             try:
                 preview = fetch_preview(row["race_date"], row["venue_code"], row["race_no"])
             except Exception as error:
