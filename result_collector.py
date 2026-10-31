@@ -1,10 +1,17 @@
 import os
+import math
 import re
 import sqlite3
 import urllib.error
 import urllib.request
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
+from result_resolution import (
+    load_resolution_index, is_terminal, valid_selection, exception_hint,
+    supported_bc_exception, official_observation_from_html,
+    corroborated_exception_observation, store_official_observation,
+    table_exists, settlement_evidence_column_exists,
+)
 
 from backtest_engine import (
     init_db,
@@ -24,6 +31,7 @@ BASE = "https://race.boatcast.jp"
 LOOKBACK_DAYS = 3
 MAX_FETCHES = 30
 GRACE_MINUTES = 3
+MAX_EXCEPTION_VERIFY_FETCHES = 1
 
 
 def connect():
@@ -105,20 +113,31 @@ def fetch_text(url):
             request,
             timeout=20,
         ) as response:
-
-            body = response.read().decode(
-                "utf-8",
-                errors="replace",
-            )
+            if response.status != 200 or response.geturl() != url:
+                print("RESULT_FETCH_UNAVAILABLE", "url=", url,
+                      "reason=UNEXPECTED_RESPONSE_IDENTITY", flush=True)
+                return None
+            raw = response.read(65537)
+            if len(raw) > 65536:
+                print("RESULT_FETCH_UNAVAILABLE", "url=", url,
+                      "reason=BODY_TOO_LARGE", flush=True)
+                return None
+            body = raw.decode("utf-8", errors="strict")
 
     except (
         urllib.error.HTTPError,
         urllib.error.URLError,
         TimeoutError,
-    ):
+        UnicodeDecodeError,
+    ) as error:
+        print("RESULT_FETCH_UNAVAILABLE", "url=", url, "error_type=",
+              type(error).__name__, "http_status=",
+              getattr(error, "code", None), flush=True)
         return None
 
     if body.lstrip().startswith("<"):
+        print("RESULT_FETCH_UNAVAILABLE", "url=", url,
+              "reason=HTML_RESPONSE", flush=True)
         return None
 
     return body
@@ -317,21 +336,83 @@ def parse_result(body):
     }
 
 
+def pending_parse_details(body):
+    """Bounded diagnostic only; no guessed void/refund status or partial save."""
+    sections = split_sections(body)
+    two = parse_2t(sections[0][0]) if sections and sections[0] else (None, None)
+    three = parse_3t(sections[2][0]) if len(sections) > 2 and sections[2] else (None, None)
+    return {
+        "sections": len(sections),
+        "2T_normal_fields": all(value is not None for value in two),
+        "3T_normal_fields": all(value is not None for value in three),
+    }
+
+
+class ExceptionVerifyBudgetExceeded(ValueError):
+    pass
+
+
+def resolve_supported_exception(body, body_url, race_id, row, fetch_budget=None):
+    """One official public GET; no retries, redirects, guessed flags or auto-DDL."""
+    supported_bc_exception(body)  # reject unknown layouts before any extra HTTP
+    with connect() as con:
+        if not table_exists(con) or not settlement_evidence_column_exists(con):
+            raise ValueError("explicit result-resolution migration required")
+        resolutions = load_resolution_index(con)
+        if race_id in resolutions:
+            if is_terminal(resolutions[race_id]):
+                return True
+            raise ValueError("existing resolution requires manual review")
+    official_url = ("https://www.boatrace.jp/owpc/pc/race/raceresult"
+                    f"?rno={int(row['race_no'])}&jcd={str(row['venue_code']).zfill(2)}&hd={row['race_date']}")
+    # Reject redirects rather than follow another host/path automatically.
+    class NoRedirect(urllib.request.HTTPRedirectHandler):
+        def redirect_request(self, *args, **kwargs):
+            return None
+    opener = urllib.request.build_opener(NoRedirect())
+    if fetch_budget is None:
+        fetch_budget = [0]
+    if fetch_budget[0] >= MAX_EXCEPTION_VERIFY_FETCHES:
+        raise ExceptionVerifyBudgetExceeded("official fetch budget exhausted")
+    fetch_budget[0] += 1  # count real attempts, not unsupported rows
+    with opener.open(official_url, timeout=10) as response:
+        if response.status != 200 or response.geturl() != official_url:
+            raise ValueError("unexpected official response identity")
+        raw = response.read(524289)
+        if len(raw) > 524288:
+            raise ValueError("oversized official result")
+        html = raw.decode("utf-8", errors="strict")
+    observed_at = datetime.now(JST).isoformat()
+    observation = official_observation_from_html(html, official_url, race_id, observed_at)
+    observation = corroborated_exception_observation(body, body_url, observation, race_id, observed_at)
+    with connect() as con:
+        inserted = store_official_observation(con, observation, race_id)
+    print("RESULT_RESOLVED_NONSTANDARD", race_id,
+          "inserted=", inserted, "source=official_and_boatcast", flush=True)
+    return True
+
+
 def get_existing_results():
     init_db()
 
     with connect() as con:
         rows = con.execute(
             """
-            SELECT race_id
+            SELECT race_id, winning_2t, winning_3t, payout_2t, payout_3t
             FROM race_results
             """
         ).fetchall()
+        resolutions = load_resolution_index(con)
 
-    return {
-        row["race_id"]
-        for row in rows
-    }
+    # A present but invalid resolution is not complete and never falls back.
+    legacy = {row["race_id"] for row in rows
+              if all(valid_selection(row["winning_"+bet.lower()], bet)
+                     and isinstance(row["payout_"+bet.lower()], (int, float))
+                     and not isinstance(row["payout_"+bet.lower()], bool)
+                     and math.isfinite(row["payout_"+bet.lower()])
+                     and row["payout_"+bet.lower()] >= 0 for bet in ("2T", "3T"))
+              and row["winning_2t"] == "-".join(row["winning_3t"].split("-")[:2])} - set(resolutions)
+    return legacy | {race_id for race_id, value in resolutions.items() if is_terminal(value)}
 
 
 def get_candidate_races():
@@ -459,6 +540,8 @@ def run():
     saved = 0
     pending = 0
     errors = 0
+    resolved_nonstandard = 0
+    exception_verifications = [0]
 
     for race_id, row in targets:
 
@@ -475,6 +558,24 @@ def run():
 
             if body is None:
                 pending += 1
+                print("RESULT_PENDING", race_id,
+                      "reason=FETCH_UNAVAILABLE", flush=True)
+                continue
+
+            if exception_hint(body):
+                try:
+                    resolve_supported_exception(body, url, race_id, row, exception_verifications)
+                    resolved_nonstandard += 1
+                except ExceptionVerifyBudgetExceeded:
+                    pending += 1
+                    print("RESULT_PENDING", race_id,
+                          "reason=EXCEPTION_VERIFY_BUDGET", flush=True)
+                except (ValueError, TypeError, KeyError, urllib.error.HTTPError,
+                        urllib.error.URLError, TimeoutError, UnicodeDecodeError) as error:
+                    pending += 1
+                    print("RESULT_PENDING", race_id, "reason=EXCEPTION_UNCONFIRMED",
+                          "error_type=", type(error).__name__,
+                          "http_status=", getattr(error, "code", None), flush=True)
                 continue
 
             result = parse_result(
@@ -483,6 +584,18 @@ def run():
 
             if result is None:
                 pending += 1
+                print("RESULT_PENDING", race_id,
+                      "reason=NORMAL_RESULT_FIELDS_INCOMPLETE",
+                      pending_parse_details(body), flush=True)
+                continue
+
+            with connect() as con:
+                resolution_present = race_id in load_resolution_index(con)
+                legacy_present = con.execute("SELECT 1 FROM race_results WHERE race_id=?", (race_id,)).fetchone() is not None
+            if resolution_present or legacy_present:
+                pending += 1
+                print("RESULT_PENDING", race_id,
+                      "reason=EXISTING_RESULT_REVIEW_REQUIRED", flush=True)
                 continue
 
             record_result(
@@ -536,6 +649,8 @@ def run():
         pending,
         "errors=",
         errors,
+        "resolved_nonstandard=",
+        resolved_nonstandard,
         flush=True,
     )
 

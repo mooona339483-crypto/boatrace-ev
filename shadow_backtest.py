@@ -1,3 +1,4 @@
+from result_resolution import load_resolution_index, is_terminal, settle_selections
 import json
 import math
 import os
@@ -28,66 +29,74 @@ def connect():
     return con
 
 
+def _attach_resolution(rows, resolutions):
+    result = []
+    for raw in rows:
+        row = dict(raw)
+        present = row["race_id"] in resolutions
+        outcome = resolutions.get(row["race_id"])
+        row["_resolution_present"] = present
+        row["_resolution"] = outcome
+        if "result_exists" in row:
+            if present:
+                row["result_exists"] = int(is_terminal(outcome))
+                market = next((m for m in outcome.markets if m.bet_type == row.get("bet_type")), None) if outcome else None
+                row["result_state"] = market.state if market else ("RESOLVED" if is_terminal(outcome) else "UNKNOWN")
+            elif "bet_type" in row:
+                winner, payout = winner_and_payout(row)
+                row["result_exists"] = int(valid_selection(winner, row["bet_type"]) and valid_number(payout) and payout >= 0)
+            else:
+                row["result_exists"] = int(all(valid_selection(row.get("winning_"+bet.lower()), bet) and valid_number(row.get("payout_"+bet.lower())) and row["payout_"+bet.lower()] >= 0 for bet in ("2T", "3T")))
+        result.append(row)
+    return result
+
+
 def load_records():
     with connect() as con:
-        rows = con.execute(
-            """
-            SELECT
-                s.id, s.race_id, s.bet_type, s.checkpoint_minutes,
-                s.actual_minutes, s.model_version, s.selections_json,
-                r.winning_2t, r.winning_3t, r.payout_2t, r.payout_3t
-            FROM shadow_prediction_records AS s
-            INNER JOIN race_results AS r
-                ON r.race_id = s.race_id
-            WHERE s.status='SHADOW_RECORDED'
-              AND s.model_version=?
+        resolutions = load_resolution_index(con)
+        rows = con.execute("""
+            SELECT s.id, s.race_id, s.bet_type, s.checkpoint_minutes,
+                   s.actual_minutes, s.model_version, s.selections_json,
+                   r.winning_2t, r.winning_3t, r.payout_2t, r.payout_3t,
+                   r.race_id AS legacy_result_exists
+            FROM shadow_prediction_records s LEFT JOIN race_results r ON r.race_id=s.race_id
+            WHERE s.status='SHADOW_RECORDED' AND s.model_version=?
             ORDER BY s.race_id, s.checkpoint_minutes, s.bet_type
-            """,
-            (MODEL_VERSION,),
-        ).fetchall()
-
+        """, (MODEL_VERSION,)).fetchall()
+        rows = [row for row in _attach_resolution(rows, resolutions)
+                if row["legacy_result_exists"] is not None or row["_resolution_present"]]
     return list(unique_records(rows))
 
 
 def load_diagnostic_records():
     with connect() as con:
-        return con.execute(
-            """
-            SELECT
-                s.race_id, s.bet_type, s.checkpoint_minutes,
-                s.selections_json,
-                CASE WHEN r.race_id IS NOT NULL THEN 1 ELSE 0 END
-                    AS result_exists
-            FROM shadow_prediction_records AS s
-            LEFT JOIN race_results AS r
-                ON r.race_id = s.race_id
-            WHERE s.status='SHADOW_RECORDED'
-              AND s.model_version=?
+        resolutions = load_resolution_index(con)
+        rows = con.execute("""
+            SELECT s.race_id, s.bet_type, s.checkpoint_minutes, s.selections_json,
+                   r.winning_2t, r.winning_3t, r.payout_2t, r.payout_3t,
+                   CASE WHEN r.race_id IS NOT NULL THEN 1 ELSE 0 END AS result_exists
+            FROM shadow_prediction_records s LEFT JOIN race_results r ON r.race_id=s.race_id
+            WHERE s.status='SHADOW_RECORDED' AND s.model_version=?
             ORDER BY s.race_id, s.checkpoint_minutes, s.bet_type
-            """,
-            (MODEL_VERSION,),
-        ).fetchall()
+        """, (MODEL_VERSION,)).fetchall()
+        return _attach_resolution(rows, resolutions)
 
 
 def load_checkpoint_status():
     with connect() as con:
-        return con.execute(
-            """
-            SELECT
-                o.race_id,
-                o.checkpoint_minutes,
-                MAX(CASE WHEN o.bet_type='2T' THEN 1 ELSE 0 END) AS has_2t,
-                MAX(CASE WHEN o.bet_type='3T' THEN 1 ELSE 0 END) AS has_3t,
-                CASE WHEN r.race_id IS NOT NULL THEN 1 ELSE 0 END
-                    AS result_exists
-            FROM odds_checkpoints AS o
-            LEFT JOIN race_results AS r
-                ON r.race_id=o.race_id
-            WHERE o.checkpoint_minutes IN (1, 2)
+        resolutions = load_resolution_index(con)
+        rows = con.execute("""
+            SELECT o.race_id, o.checkpoint_minutes,
+                   MAX(CASE WHEN o.bet_type='2T' THEN 1 ELSE 0 END) AS has_2t,
+                   MAX(CASE WHEN o.bet_type='3T' THEN 1 ELSE 0 END) AS has_3t,
+                   r.winning_2t, r.winning_3t, r.payout_2t, r.payout_3t,
+                   CASE WHEN r.race_id IS NOT NULL THEN 1 ELSE 0 END AS result_exists
+            FROM odds_checkpoints o LEFT JOIN race_results r ON r.race_id=o.race_id
+            WHERE o.checkpoint_minutes IN (1,2)
             GROUP BY o.race_id, o.checkpoint_minutes
             ORDER BY o.race_id, o.checkpoint_minutes
-            """
-        ).fetchall()
+        """).fetchall()
+        return _attach_resolution(rows, resolutions)
 
 
 def valid_number(value):
@@ -294,6 +303,7 @@ def build_diagnostics(
         )
 
         info["detail"] = "shadow_record"
+        info["result_state"] = dict(row).get("result_state", "LEGACY")
         info["result_exists"] = bool(
             row["result_exists"]
         )
@@ -422,6 +432,9 @@ def build_diagnostics(
                 race_id
             ] = reason
 
+    for race_id in pending_races:
+        race_reasons.pop(race_id, None)
+
     return {
         "slots":
             slots,
@@ -535,174 +548,61 @@ def winner_and_payout(
     )
 
 
-def evaluate_group(
-    rows,
-    checkpoint,
-    bet_type,
-    min_ev,
-):
-    available = 0
-    bet_races = 0
-    selections_count = 0
-    hits = 0
-    stake = 0
-    payout_total = 0
-
-    for row in unique_records(
-        rows
-    ):
-        if (
-            row[
-                "checkpoint_minutes"
-            ]
-            != checkpoint
-            or row[
-                "bet_type"
-            ]
-            != bet_type
-        ):
+def evaluate_group(rows, checkpoint, bet_type, min_ev):
+    available = bet_races = selections_count = hits = stake = payout_total = 0
+    refund_stake = decision_races = void_races = pending_results = 0
+    for raw in unique_records(rows):
+        row = dict(raw)
+        if row["checkpoint_minutes"] != checkpoint or row["bet_type"] != bet_type:
             continue
-
-        (
-            winner,
-            payout,
-        ) = winner_and_payout(
-            row
-        )
-
-        if (
-            not valid_selection(
-                winner,
-                bet_type,
-            )
-            or not valid_number(
-                payout
-            )
-            or payout < 0
-        ):
-            continue
-
+        outcome = row.get("_resolution")
+        present = row.get("_resolution_present", False)
+        if present:
+            if not is_terminal(outcome):
+                pending_results += 1
+                continue
+            market = next(m for m in outcome.markets if m.bet_type == bet_type)
+            void_races += market.state == "VOID"
+        else:
+            winner, payout = winner_and_payout(row)
+            if not valid_selection(winner, bet_type) or not valid_number(payout) or payout < 0:
+                continue
         available += 1
-
         try:
-            selections = json.loads(
-                row[
-                    "selections_json"
-                ]
-            )
-
-        except (
-            TypeError,
-            ValueError,
-            RecursionError,
-        ):
+            selections = json.loads(row["selections_json"])
+        except (TypeError, ValueError, RecursionError):
             continue
-
-        selected = (
-            select_candidates(
-                selections,
-                bet_type,
-                min_ev,
-            )
-        )
-
+        selected = select_candidates(selections, bet_type, min_ev)
         if not selected:
             continue
-
+        if present:
+            tickets = [{"selection": item["selection"], "stake": STAKE_PER_SELECTION} for item in selected]
+            result = settle_selections(outcome, bet_type, tickets)
+            if result is None:
+                pending_results += 1
+                continue
+            row_payout = result["total_payout"]
+            row_hits = result["hits"]
+            refund_stake += result["refund_stake"]
+            decision_races += result["has_decision"]
+        else:
+            row_hits = sum(item["selection"] == winner for item in selected)
+            row_payout = row_hits * int(round(STAKE_PER_SELECTION / 100 * payout))
+            decision_races += 1
         bet_races += 1
-        race_hit = False
-
-        for item in selected:
-            selections_count += 1
-
-            stake += (
-                STAKE_PER_SELECTION
-            )
-
-            if (
-                item[
-                    "selection"
-                ]
-                == winner
-            ):
-                race_hit = True
-
-                payout_total += int(
-                    round(
-                        STAKE_PER_SELECTION
-                        / 100
-                        * payout
-                    )
-                )
-
-        if race_hit:
-            hits += 1
-
-    profit = (
-        payout_total
-        - stake
-    )
-
-    return {
-        "checkpoint":
-            checkpoint,
-
-        "bet_type":
-            bet_type,
-
-        "min_ev":
-            min_ev,
-
-        "min_probability":
-            MIN_PROBABILITY[
-                bet_type
-            ],
-
-        "available_races":
-            available,
-
-        "races_with_bets":
-            bet_races,
-
-        "selections":
-            selections_count,
-
-        "hit_races":
-            hits,
-
-        "stake":
-            stake,
-
-        "payout":
-            payout_total,
-
-        "profit":
-            profit,
-
-        "roi":
-            (
-                payout_total
-                / stake
-                if stake
-                else None
-            ),
-
-        "hit_rate":
-            (
-                hits
-                / bet_races
-                if bet_races
-                else None
-            ),
-
-        "coverage":
-            (
-                bet_races
-                / available
-                if available
-                else None
-            ),
-    }
+        selections_count += len(selected)
+        stake += len(selected) * STAKE_PER_SELECTION
+        payout_total += row_payout
+        hits += row_hits > 0
+    return {"checkpoint": checkpoint, "bet_type": bet_type, "min_ev": min_ev,
+            "min_probability": MIN_PROBABILITY[bet_type], "available_races": available,
+            "races_with_bets": bet_races, "selections": selections_count,
+            "hit_races": hits, "stake": stake, "payout": payout_total,
+            "profit": payout_total - stake, "roi": payout_total / stake if stake else None,
+            "hit_rate": hits / decision_races if decision_races else None,
+            "coverage": bet_races / available if available else None,
+            "refund_stake": refund_stake, "decision_races": decision_races,
+            "void_races": void_races, "pending_result_races": pending_results}
 
 
 def format_percent(
@@ -802,6 +702,7 @@ def print_diagnostics(
                 f"checkpoint={checkpoint}",
                 f"bet={bet_type}",
                 f"slots={len(selected)}",
+                f"void_slots={sum(info.get('result_state') == 'VOID' for info in selected)}",
                 f"data_missing={reasons['DATA_MISSING']}",
                 f"low_probability={reasons['LOW_PROBABILITY']}",
                 f"low_ev={reasons['LOW_EV']}",
@@ -928,6 +829,10 @@ def print_backtest(
         f"minProb={format_percent(result['min_probability'])}",
         f"minEV={format_percent(result['min_ev'])}",
         f"available={result['available_races']}",
+        f"decision_races={result.get('decision_races', 0)}",
+        f"void_races={result.get('void_races', 0)}",
+        f"refund_stake={result.get('refund_stake', 0)}",
+        f"pending_result_races={result.get('pending_result_races', 0)}",
         f"bet_races={result['races_with_bets']}",
         f"selections={result['selections']}",
         f"hits={result['hit_races']}",
@@ -956,8 +861,12 @@ def run():
     )
 
     race_ids = {
-        row["race_id"]
-        for row in rows
+        row["race_id"] for row in rows
+        if ((not row.get("_resolution_present", False)
+             and valid_selection(winner_and_payout(row)[0], row["bet_type"])
+             and valid_number(winner_and_payout(row)[1]))
+            or (is_terminal(row.get("_resolution"))
+                and any(m.bet_type == row["bet_type"] and m.state == "SETTLED" for m in row["_resolution"].markets)))
     }
 
     print(
@@ -965,6 +874,7 @@ def run():
         f"records={len(rows)}",
         f"races={len(race_ids)}",
         f"model={MODEL_VERSION}",
+        "races_scope=decision_capable",
         flush=True,
     )
 
@@ -1015,6 +925,7 @@ def run():
             and result[
                 "races_with_bets"
             ] > 0
+            and result["decision_races"] > 0
         )
     ]
 

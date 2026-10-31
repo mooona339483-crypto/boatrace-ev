@@ -1,3 +1,4 @@
+from result_resolution import load_resolution_index, settle_selections, settlement_evidence_column_exists
 import json
 import math
 import os
@@ -190,11 +191,20 @@ def settle_prediction(
         ]
     )
 
-    selections = json.loads(
-        prediction_row[
-            "selections_json"
-        ]
-    )
+    try:
+        selections = json.loads(prediction_row["selections_json"])
+    except (TypeError, ValueError, RecursionError):
+        return None
+
+    if "_resolution_present" in result_row.keys() and result_row["_resolution_present"]:
+        outcome = result_row["_resolution"]
+        if outcome is None:
+            return None
+        value = settle_selections(outcome, bet_type, selections)
+        if value is None:
+            return None
+        return {"prediction_id": prediction_row["id"], "race_id": prediction_row["race_id"],
+                "bet_type": bet_type, **value}
 
     if bet_type == "2T":
         winner = (
@@ -301,7 +311,7 @@ def settle_prediction(
     }
 
 
-def settle_all():
+def _legacy_settle_all():
     init_db()
 
     settled_at = (
@@ -394,7 +404,7 @@ def settle_all():
     }
 
 
-def report():
+def _legacy_report():
     init_db()
 
     with connect() as con:
@@ -511,7 +521,130 @@ def report():
     return summary
 
 
+def _prediction_source_available(con):
+    return con.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='prediction_records'").fetchone() is not None
+
+
+def _missing_prediction_report(con):
+    exists = con.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='settlement_records'").fetchone() is not None
+    counts = dict(con.execute("SELECT bet_type,COUNT(*) FROM settlement_records GROUP BY bet_type").fetchall()) if exists else {}
+    return {bet: {"races": None, "hit_races": None, "stake": None, "payout": None,
+                  "profit": None, "hit_rate": None, "roi": None,
+                  "pending_predictions": None, "complete": False,
+                  "full_history_profit": None, "profit_scope": "unavailable",
+                  "data_status": "PREDICTION_RECORDS_MISSING",
+                  "excluded_stale_settlements": counts.get(bet, 0)} for bet in ("2T", "3T")}
+
+
+def settle_all():
+    with connect() as con:
+        if not _prediction_source_available(con):
+            return {"settled": 0, "skipped": 0, "status": "PREDICTION_RECORDS_MISSING"}
+    init_db()
+    with connect() as con:
+        resolutions = load_resolution_index(con)
+        if not resolutions:
+            return _legacy_settle_all()
+        has_column = settlement_evidence_column_exists(con)
+        rows = con.execute("""
+            SELECT p.*, r.winning_2t, r.winning_3t, r.payout_2t, r.payout_3t
+            FROM prediction_records p
+            LEFT JOIN race_results r ON p.race_id=r.race_id
+            LEFT JOIN settlement_records s ON p.id=s.prediction_id
+            WHERE p.verified=1 AND s.id IS NULL ORDER BY p.id
+        """).fetchall()
+        settled = skipped = 0
+        for raw in rows:
+            row = dict(raw)
+            row["_resolution_present"] = row["race_id"] in resolutions
+            row["_resolution"] = resolutions.get(row["race_id"])
+            try:
+                result = settle_prediction(row, row)
+            except (TypeError, ValueError, KeyError, RecursionError, OverflowError):
+                result = None
+            if result is None or (row["_resolution_present"] and not has_column):
+                skipped += 1
+                continue
+            names = ["prediction_id", "race_id", "bet_type", "total_stake", "total_payout", "profit", "hits"]
+            values = [result[name] for name in names]
+            names.append("settled_at")
+            values.append(datetime.now(JST).isoformat())
+            if has_column:
+                names.append("result_source_sha256")
+                values.append(result.get("result_source_sha256"))
+            cursor = con.execute("INSERT OR IGNORE INTO settlement_records (" + ",".join(names) + ") VALUES (" + ",".join("?" for _ in names) + ")", values)
+            settled += cursor.rowcount
+        return {"settled": settled, "skipped": skipped}
+
+
+def report():
+    with connect() as con:
+        if not _prediction_source_available(con):
+            return _missing_prediction_report(con)
+    init_db()
+    with connect() as con:
+        resolutions = load_resolution_index(con)
+        tagged = settlement_evidence_column_exists(con) and con.execute("SELECT 1 FROM settlement_records WHERE result_source_sha256 IS NOT NULL LIMIT 1").fetchone() is not None
+        if not resolutions and not tagged:
+            return _legacy_report()
+        pending = dict(con.execute("""
+            SELECT p.bet_type, COUNT(*) FROM prediction_records p
+            LEFT JOIN settlement_records s ON s.prediction_id=p.id
+            WHERE p.verified=1 AND s.id IS NULL GROUP BY p.bet_type
+        """).fetchall())
+        rows = con.execute("""
+            SELECT s.*, p.selections_json, p.race_id AS prediction_race_id,
+                   p.bet_type AS prediction_bet_type, p.verified AS prediction_verified
+            FROM settlement_records s LEFT JOIN prediction_records p ON p.id=s.prediction_id
+        """).fetchall()
+    summary = {bet: {"races": 0, "hit_races": 0, "stake": 0, "payout": 0, "profit": 0,
+                     "hit_rate": None, "roi": None, "decision_races": 0,
+                     "refund_stake": 0, "excluded_stale_settlements": 0} for bet in ("2T", "3T")}
+    for raw in rows:
+        row = dict(raw)
+        if row["bet_type"] not in summary:
+            continue
+        group = summary[row["bet_type"]]
+        decision, refund = True, 0
+        if row["race_id"] in resolutions:
+            outcome = resolutions[row["race_id"]]
+            result = None
+            if (outcome is not None and row.get("result_source_sha256") == outcome.source_sha256
+                    and row.get("prediction_race_id") == row["race_id"]
+                    and row.get("prediction_bet_type") == row["bet_type"]
+                    and row.get("prediction_verified") == 1):
+                try:
+                    result = settle_selections(outcome, row["bet_type"], json.loads(row["selections_json"]))
+                except (TypeError, ValueError, RecursionError):
+                    pass
+            if result is None or any(row[key] != result[key] for key in ("total_stake", "total_payout", "profit", "hits")):
+                group["excluded_stale_settlements"] += 1
+                continue
+            decision, refund = result["has_decision"], result["refund_stake"]
+        elif row.get("result_source_sha256"):
+            group["excluded_stale_settlements"] += 1
+            continue
+        group["races"] += 1
+        group["decision_races"] += bool(decision)
+        group["hit_races"] += row["hits"] > 0
+        group["stake"] += row["total_stake"]
+        group["payout"] += row["total_payout"]
+        group["profit"] += row["profit"]
+        group["refund_stake"] += refund
+    for bet, group in summary.items():
+        group["pending_predictions"] = pending.get(bet, 0)
+        group["complete"] = not (group["pending_predictions"] or group["excluded_stale_settlements"])
+        group["profit_scope"] = "confirmed_settlements_only"
+        group["full_history_profit"] = group["profit"] if group["complete"] else None
+        group["hit_rate"] = round(group["hit_races"] / group["decision_races"], 4) if group["decision_races"] else None
+        group["roi"] = round(group["payout"] / group["stake"], 4) if group["stake"] else None
+    return summary
+
+
 def calibration_report():
+    with connect() as con:
+        if not _prediction_source_available(con):
+            return {"2T": [], "3T": [], "status": "PREDICTION_RECORDS_MISSING"}
     init_db()
 
     buckets = [
@@ -526,9 +659,11 @@ def calibration_report():
     samples = []
 
     with connect() as con:
+        resolutions = load_resolution_index(con)
         rows = con.execute(
             """
             SELECT
+                p.race_id,
                 p.bet_type,
                 p.selections_json,
                 r.winning_2t,
@@ -541,6 +676,9 @@ def calibration_report():
         ).fetchall()
 
     for row in rows:
+        # Exceptions (including invalid evidence) are not normal calibration outcomes.
+        if row["race_id"] in resolutions:
+            continue
 
         selections = json.loads(
             row[
@@ -559,6 +697,13 @@ def calibration_report():
                 "winning_3t"
             ]
         )
+
+        if winner is None:
+            continue
+        try:
+            validate_selection(winner, row["bet_type"])
+        except (TypeError, ValueError):
+            continue
 
         for item in selections:
             samples.append(
