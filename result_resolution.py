@@ -293,10 +293,10 @@ def supported_bc_exception(body):
             continue
         winner = '-'.join((row[0], row[2])) if bet == '2T' else '-'.join(row[:3])
         if (not valid_selection(winner, bet) or (bet == '2T' and row[1] != '-')
-                or not re.fullmatch(r'[1-9]\d*', row[3]) or row[4] != '円'
+                or not re.fullmatch(r'(?:[1-9][0-9]*|[1-9][0-9]{0,2}(?:,[0-9]{3})+)', row[3]) or row[4] != '円'
                 or not re.fullmatch(r'[1-9]\d*', row[5])):
             raise ValueError('unsupported result row')
-        markets.append(MarketOutcome(bet, 'SETTLED', winner, int(row[3])))
+        markets.append(MarketOutcome(bet, 'SETTLED', winner, int(row[3].replace(',', ''))))
     return tuple(markets), tuple(sorted(map(int, header[2])))
 
 
