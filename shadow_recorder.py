@@ -868,6 +868,11 @@ def record_one(*, row, race_info, racelist, preview, bet_type,
 def record_ready_predictions():
     init_db()
     saved = skipped = errors = 0
+    # Prior-date incomplete pairs are revisited on every capture. Aggregate
+    # only valid past dates; today's and unknown-date details stay visible.
+    preview_skipped_pairs = 0
+    preview_skipped_bets = 0
+    preview_skip_sample_limit = 3
     for row in get_checkpoint_pairs():
         race_id = "unknown"
         checkpoint = None
@@ -889,11 +894,22 @@ def record_ready_predictions():
             # pre-deadline diagnostic handling and all later save guards remain.
             deadline = race_info["deadline"] if race_info is not None else None
             if not before_deadline(row["race_date"], deadline):
-                skipped += sum(not already_recorded(race_id, bet, checkpoint)
-                               for bet in ("2T", "3T"))
-                print("SHADOW_PREVIEW_SKIPPED", race_id, "checkpoint=", checkpoint,
-                      "reason=DEADLINE_PASSED_OR_UNKNOWN", "verified=", False,
-                      flush=True)
+                pending_bets = sum(not already_recorded(race_id, bet, checkpoint)
+                                   for bet in ("2T", "3T"))
+                skipped += pending_bets
+                try:
+                    race_day = datetime.strptime(row["race_date"], "%Y%m%d").date()
+                    historical = (race_day.strftime("%Y%m%d") == row["race_date"]
+                                  and race_day < now_jst().date())
+                except (TypeError, ValueError):
+                    historical = False
+                if historical:
+                    preview_skipped_pairs += 1
+                    preview_skipped_bets += pending_bets
+                if not historical or preview_skipped_pairs <= preview_skip_sample_limit:
+                    print("SHADOW_PREVIEW_SKIPPED", race_id, "checkpoint=", checkpoint,
+                          "reason=DEADLINE_PASSED_OR_UNKNOWN", "verified=", False,
+                          flush=True)
                 continue
             try:
                 preview = fetch_preview(row["race_date"], row["venue_code"], row["race_no"])
@@ -927,6 +943,13 @@ def record_ready_predictions():
             errors += 1
             print("SHADOW_ERROR", race_id, "checkpoint=", checkpoint,
                   type(error).__name__, str(error)[:160], flush=True)
+    if preview_skipped_pairs:
+        logged_pairs = min(preview_skipped_pairs, preview_skip_sample_limit)
+        print("SHADOW_PREVIEW_SKIP_SUMMARY", "pairs=", preview_skipped_pairs,
+              "pending_bets=", preview_skipped_bets, "logged_pairs=", logged_pairs,
+              "suppressed_pairs=", preview_skipped_pairs - logged_pairs,
+              "scope=prior_dates", "reason=DEADLINE_PASSED_OR_UNKNOWN",
+              "verified=", False, flush=True)
     print("SHADOW_DONE", "saved=", saved, "skipped=", skipped,
           "errors=", errors, "verified=", False, flush=True)
     return {"saved": saved, "skipped": skipped, "errors": errors}
